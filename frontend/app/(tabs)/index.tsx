@@ -12,8 +12,12 @@ export default function HomeScreen() {
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [transcription, setTranscription] = useState<string>('');
+  const [groqResponse, setGroqResponse] = useState<string>('');
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const recordingRef = useRef<Audio.Recording | null>(null);
+  const soundRef = useRef<Audio.Sound | null>(null);
 
   useEffect(() => {
     checkPermission();
@@ -55,8 +59,20 @@ export default function HomeScreen() {
               console.log('Backend received audio:', data.message);
               setIsProcessing(false);
               if (data.error) {
+                setTranscription('');
+                setGroqResponse('');
                 Alert.alert('Error', data.message);
               } else {
+                if (data.transcription) {
+                  setTranscription(data.transcription);
+                }
+                if (data.response) {
+                  setGroqResponse(data.response);
+                }
+                if (data.speechAudio) {
+                  // Play the audio response
+                  playAudioResponse(data.speechAudio);
+                }
                 Alert.alert('Success', data.message);
               }
               break;
@@ -225,6 +241,43 @@ export default function HomeScreen() {
     }
   };
 
+  // Function to play audio response
+  const playAudioResponse = async (audioBase64: string) => {
+    try {
+      setIsPlayingAudio(true);
+      console.log('Playing audio response...');
+      
+      // Create a temporary file for the audio
+      const audioUri = FileSystem.documentDirectory + 'response_audio.mp3';
+      
+      // Write base64 audio to file
+      await FileSystem.writeAsStringAsync(audioUri, audioBase64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      
+      // Load and play the audio
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: audioUri },
+        { shouldPlay: true }
+      );
+      
+      soundRef.current = sound;
+      
+      // Set up playback status update
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.isLoaded && status.didJustFinish) {
+          setIsPlayingAudio(false);
+          sound.unloadAsync();
+        }
+      });
+      
+    } catch (error) {
+      console.error('Error playing audio:', error);
+      setIsPlayingAudio(false);
+      Alert.alert('Audio Error', 'Failed to play audio response');
+    }
+  };
+
   return (
     <ThemedView style={styles.container}>
       {/* Header */}
@@ -259,11 +312,29 @@ export default function HomeScreen() {
             ? 'Tap to grant microphone permission' 
             : isProcessing
             ? 'Processing audio...'
+            : isPlayingAudio
+            ? 'Playing response...'
             : isRecording 
             ? 'Recording... Tap to stop' 
             : 'Tap to start voice assistant'
           }
         </ThemedText>
+        
+        {/* Transcription Result */}
+        {transcription ? (
+          <ThemedView style={styles.resultContainer}>
+            <ThemedText style={styles.resultLabel}>You said:</ThemedText>
+            <ThemedText style={styles.transcriptionText}>{transcription}</ThemedText>
+          </ThemedView>
+        ) : null}
+        
+        {/* Groq Response */}
+        {groqResponse ? (
+          <ThemedView style={styles.responseContainer}>
+            <ThemedText style={styles.resultLabel}>Assistant:</ThemedText>
+            <ThemedText style={styles.responseText}>{groqResponse}</ThemedText>
+          </ThemedView>
+        ) : null}
         
         {/* Connection Status */}
         <ThemedText style={[styles.connectionStatus, { color: isConnected ? '#34C759' : '#FF3B30' }]}>
@@ -360,5 +431,35 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
     paddingHorizontal: 20,
+  },
+  resultContainer: {
+    marginTop: 20,
+    padding: 15,
+    borderRadius: 10,
+    backgroundColor: 'rgba(0, 122, 255, 0.1)',
+    width: '90%',
+  },
+  responseContainer: {
+    marginTop: 15,
+    padding: 15,
+    borderRadius: 10,
+    backgroundColor: 'rgba(52, 199, 89, 0.1)',
+    width: '90%',
+  },
+  resultLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 8,
+    color: '#007AFF',
+  },
+  transcriptionText: {
+    fontSize: 16,
+    lineHeight: 24,
+    fontStyle: 'italic',
+  },
+  responseText: {
+    fontSize: 16,
+    lineHeight: 24,
+    fontWeight: '500',
   },
 });

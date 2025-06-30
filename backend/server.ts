@@ -5,6 +5,8 @@ import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import { AssemblyAI } from 'assemblyai';
+import Groq from 'groq-sdk';
+import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 import dotenv from 'dotenv';
 
 // Load environment variables
@@ -17,12 +19,38 @@ if (!process.env.ASSEMBLYAI_API_KEY) {
   process.exit(1);
 }
 
+// Check if Groq API key is set
+if (!process.env.GROQ_API_KEY) {
+  console.error('❌ GROQ_API_KEY is not set in .env file');
+  console.log('Please get your API key from https://console.groq.com/');
+  process.exit(1);
+}
+
+// Check if Google credentials are set
+if (!process.env.GOOGLE_TTS_API_KEY) {
+  console.error('❌ GOOGLE_TTS_API_KEY is not set in .env file');
+  console.log('Please get your API key from Google Cloud Console');
+  process.exit(1);
+}
+
 // Initialize AssemblyAI client
 const client = new AssemblyAI({
   apiKey: process.env.ASSEMBLYAI_API_KEY
 });
 
+// Initialize Groq client
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY
+});
+
+// Initialize Google TTS client with API key
+const ttsClient = new TextToSpeechClient({
+  apiKey: process.env.GOOGLE_TTS_API_KEY
+});
+
 console.log('✅ AssemblyAI client initialized');
+console.log('✅ Groq client initialized');
+console.log('✅ Google TTS client initialized');
 
 const app = express();
 const server = createServer(app);
@@ -66,6 +94,82 @@ async function transcribeAudio(filepath: string): Promise<string> {
   } catch (error: any) {
     console.error('[ERROR] AssemblyAI transcription error:', error.message);
     throw new Error(`Failed to transcribe audio: ${error.message}`);
+  }
+}
+
+// Function to process transcribed text with Groq LLM
+async function processWithGroq(transcribedText: string): Promise<string> {
+  try {
+    console.log('[DEBUG] Sending text to Groq LLM:', transcribedText);
+    
+    const start = Date.now();
+    
+    const chatCompletion = await groq.chat.completions.create({
+      messages: [
+        {
+          role: "system", 
+          content: "You are a helpful voice assistant. Provide clear, concise, and friendly responses to user queries."
+        },
+        {
+          role: "user",
+          content: transcribedText
+        }
+      ],
+      model: "llama3-8b-8192", // Updated to a supported model
+      temperature: 0.7,
+      max_tokens: 150 // Keep responses concise for voice
+    });
+
+    const response = chatCompletion.choices[0]?.message?.content || 'I apologize, but I could not generate a response.';
+    
+    console.log('[DEBUG] Groq returned in', Date.now() - start, 'ms');
+    console.log('[DEBUG] Groq response:', response);
+    
+    return response;
+  } catch (error: any) {
+    console.error('[ERROR] Groq LLM error:', error.message);
+    throw new Error(`Failed to process with Groq: ${error.message}`);
+  }
+}
+
+// Function to convert text to speech using Google TTS
+async function convertTextToSpeech(text: string): Promise<string> {
+  try {
+    console.log('[DEBUG] Converting text to speech:', text);
+    
+    const start = Date.now();
+    
+    const request = {
+      input: { text: text },
+      voice: {
+        languageCode: 'en-US',
+        name: 'en-US-Standard-D', // Male voice
+        ssmlGender: 'MALE' as const
+      },
+      audioConfig: {
+        audioEncoding: 'MP3' as const,
+        speakingRate: 1.0,
+        pitch: 0.0,
+        volumeGainDb: 0.0
+      }
+    };
+
+    const [response] = await ttsClient.synthesizeSpeech(request);
+    
+    if (!response.audioContent) {
+      throw new Error('No audio content received from Google TTS');
+    }
+    
+    // Convert audio to base64 for transmission
+    const audioBase64 = Buffer.from(response.audioContent).toString('base64');
+    
+    console.log('[DEBUG] Google TTS returned in', Date.now() - start, 'ms');
+    console.log('[DEBUG] Audio size:', audioBase64.length, 'characters');
+    
+    return audioBase64;
+  } catch (error: any) {
+    console.error('[ERROR] Google TTS error:', error.message);
+    throw new Error(`Failed to convert text to speech: ${error.message}`);
   }
 }
 
@@ -157,14 +261,47 @@ wss.on('connection', (ws: WebSocket) => {
               const transcription = await transcribeAudio(filepath);
               console.log('[DEBUG] Transcription complete:', transcription);
 
-              // Send success response back to client with transcription
-              ws.send(JSON.stringify({
-                type: 'audio_received',
-                message: 'Voice processed successfully',
-                transcription: transcription,
-                filename: filename
-              }));
-              console.log('[DEBUG] Sent transcription to client.');
+              // Process the transcription with Groq LLM
+              try {
+                console.log('[DEBUG] Starting Groq processing...');
+                const response = await processWithGroq(transcription);
+                console.log('[DEBUG] Groq processing complete:', response);
+
+                // Convert the response to speech
+                try {
+                  console.log('[DEBUG] Starting text-to-speech conversion...');
+                  const speechAudio = await convertTextToSpeech(response);
+                  console.log('[DEBUG] Text-to-speech conversion complete');
+
+                  // Send success response back to client with transcription, response, and audio
+                  ws.send(JSON.stringify({
+                    type: 'audio_received',
+                    message: 'Voice processed successfully',
+                    transcription: transcription,
+                    response: response,
+                    speechAudio: speechAudio,
+                    filename: filename
+                  }));
+                  console.log('[DEBUG] Sent transcription, response, and speech audio to client.');
+                } catch (ttsError: any) {
+                  console.error('[ERROR] Text-to-speech failed:', ttsError);
+                  // Send response without audio if TTS fails
+                  ws.send(JSON.stringify({
+                    type: 'audio_received',
+                    message: 'Voice processed successfully (no audio)',
+                    transcription: transcription,
+                    response: response,
+                    filename: filename
+                  }));
+                }
+              } catch (groqError: any) {
+                console.error('[ERROR] Groq processing failed:', groqError);
+                ws.send(JSON.stringify({
+                  type: 'audio_received',
+                  message: 'Error during Groq processing: ' + (groqError.message || groqError),
+                  error: true
+                }));
+              }
             } catch (transcriptionError: any) {
               console.error('[ERROR] AssemblyAI transcription failed:', transcriptionError);
               ws.send(JSON.stringify({

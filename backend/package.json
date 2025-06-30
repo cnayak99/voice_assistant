@@ -17,10 +17,12 @@
   "license": "ISC",
   "description": "Voice Assistant Backend with WebSocket support",
   "dependencies": {
+    "@google-cloud/text-to-speech": "^6.1.0",
     "assemblyai": "^4.13.3",
     "cors": "^2.8.5",
     "dotenv": "^17.0.0",
     "express": "^5.1.0",
+    "groq-sdk": "^0.26.0",
     "node-vad": "^1.1.4",
     "openai": "^5.8.2",
     "ws": "^8.18.3"
