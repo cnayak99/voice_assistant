@@ -54,8 +54,7 @@ const wss = new ws_1.WebSocketServer({ server });
 // Middleware
 app.use((0, cors_1.default)());
 app.use(express_1.default.json({ limit: '50mb' }));
-// Store connected clients
-const clients = new Set();
+const clients = new Map();
 // Create audio directory if it doesn't exist
 const audioDir = path_1.default.join(__dirname, 'audio');
 if (!fs_1.default.existsSync(audioDir)) {
@@ -85,7 +84,7 @@ async function transcribeAudio(filepath) {
     }
 }
 // Function to process transcribed text with Groq LLM
-async function processWithGroq(transcribedText) {
+async function processWithGroq(transcribedText, abortSignal) {
     try {
         console.log('[DEBUG] Sending text to Groq LLM:', transcribedText);
         const start = Date.now();
@@ -103,6 +102,8 @@ async function processWithGroq(transcribedText) {
             model: "llama3-8b-8192", // Updated to a supported model
             temperature: 0.7,
             max_tokens: 150 // Keep responses concise for voice
+        }, {
+            signal: abortSignal // Add abort signal support
         });
         const response = chatCompletion.choices[0]?.message?.content || 'I apologize, but I could not generate a response.';
         console.log('[DEBUG] Groq returned in', Date.now() - start, 'ms');
@@ -110,6 +111,10 @@ async function processWithGroq(transcribedText) {
         return response;
     }
     catch (error) {
+        if (error.name === 'AbortError') {
+            console.log('[DEBUG] Groq request was aborted');
+            throw new Error('Request cancelled');
+        }
         console.error('[ERROR] Groq LLM error:', error.message);
         throw new Error(`Failed to process with Groq: ${error.message}`);
     }
@@ -151,7 +156,16 @@ async function convertTextToSpeech(text) {
 // WebSocket connection handling
 wss.on('connection', (ws) => {
     console.log('New WebSocket connection established');
-    clients.add(ws);
+    // Initialize client state
+    const clientState = {
+        ws: ws,
+        isListening: false,
+        isProcessing: false,
+        currentTTSGeneration: null,
+        currentRequestId: null,
+        abortController: null
+    };
+    clients.set(ws, clientState);
     ws.on('message', async (message) => {
         try {
             console.log('[DEBUG] Received message type:', typeof message);
@@ -185,27 +199,103 @@ wss.on('connection', (ws) => {
             console.error('[ERROR] Error processing message:', error);
         }
     });
+    // Function to handle AI interruption
+    async function handleAIInterrupt(ws, clientState) {
+        try {
+            console.log('[DEBUG] Handling AI interrupt...');
+            // Abort any ongoing request
+            if (clientState.abortController) {
+                clientState.abortController.abort();
+                console.log('[DEBUG] Aborted ongoing request');
+            }
+            // Cancel any ongoing TTS generation
+            if (clientState.currentTTSGeneration) {
+                // Note: Google TTS doesn't have a direct cancel method, but we can ignore the result
+                clientState.currentTTSGeneration = null;
+            }
+            // Reset client state
+            clientState.isProcessing = false;
+            clientState.currentRequestId = null;
+            clientState.abortController = null;
+            // Send confirmation to client
+            ws.send(JSON.stringify({
+                type: 'ai_interrupted',
+                message: 'AI response interrupted'
+            }));
+            console.log('[DEBUG] AI interrupt handled successfully');
+        }
+        catch (error) {
+            console.error('[ERROR] Error handling AI interrupt:', error);
+        }
+    }
+    // Function to handle processing cancellation
+    async function handleProcessingCancel(ws, clientState) {
+        try {
+            console.log('[DEBUG] Handling processing cancellation...');
+            // Abort any ongoing request
+            if (clientState.abortController) {
+                clientState.abortController.abort();
+                console.log('[DEBUG] Aborted ongoing request');
+            }
+            // Cancel ongoing processing
+            clientState.isProcessing = false;
+            clientState.currentTTSGeneration = null;
+            clientState.currentRequestId = null;
+            clientState.abortController = null;
+            // Send confirmation to client
+            ws.send(JSON.stringify({
+                type: 'processing_cancelled',
+                message: 'Processing cancelled'
+            }));
+            console.log('[DEBUG] Processing cancellation handled successfully');
+        }
+        catch (error) {
+            console.error('[ERROR] Error handling processing cancel:', error);
+        }
+    }
     // Helper function to handle JSON messages
     async function handleJsonMessage(ws, data) {
         console.log('[DEBUG] Handling JSON message type:', data.type);
+        const clientState = clients.get(ws);
+        if (!clientState)
+            return;
         // Handle different message types
         switch (data.type) {
-            case 'voice_start':
-                console.log('Voice listening started');
+            case 'start_listening':
+                console.log('Client started listening (hold-to-talk)');
+                clientState.isListening = true;
+                clientState.isProcessing = false;
                 ws.send(JSON.stringify({
-                    type: 'voice_start_ack',
-                    message: 'Voice listening started'
+                    type: 'listening_started',
+                    message: 'Ready to receive audio'
                 }));
                 break;
-            case 'voice_stop':
-                console.log('Voice listening stopped');
+            case 'stop_listening':
+                console.log('Client stopped listening (released button)');
+                clientState.isListening = false;
                 ws.send(JSON.stringify({
-                    type: 'voice_stop_ack',
-                    message: 'Voice listening stopped'
+                    type: 'listening_stopped',
+                    message: 'Processing audio...'
                 }));
+                break;
+            case 'interrupt_ai':
+                console.log('🛑 AI interrupted by user');
+                await handleAIInterrupt(ws, clientState);
+                break;
+            case 'cancel_processing':
+                console.log('🛑 Processing cancelled by user');
+                await handleProcessingCancel(ws, clientState);
                 break;
             case 'audio_complete':
                 console.log('🎤 Voice received!');
+                // Generate unique request ID and create abort controller
+                const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                const abortController = new AbortController();
+                // Update client state
+                clientState.isProcessing = true;
+                clientState.currentRequestId = requestId;
+                clientState.abortController = abortController;
+                console.log(`[DEBUG] Starting request ${requestId}`);
                 console.log(`Duration: ${data.duration}ms`);
                 console.log(`Format: ${data.format}`);
                 console.log(`Sample Rate: ${data.sampleRate}Hz`);
@@ -222,21 +312,43 @@ wss.on('connection', (ws) => {
                         const audioBuffer = Buffer.from(data.audioData, 'base64');
                         fs_1.default.writeFileSync(filepath, audioBuffer);
                         console.log(`[DEBUG] Audio file saved: ${filename}, size: ${audioBuffer.length} bytes`);
+                        // Send processing started notification
+                        ws.send(JSON.stringify({
+                            type: 'processing_started',
+                            message: 'AI is thinking...',
+                            requestId: requestId
+                        }));
                         // Transcribe the audio using AssemblyAI
                         try {
-                            console.log('[DEBUG] Starting transcription with AssemblyAI...');
+                            console.log(`[DEBUG] [${requestId}] Starting transcription with AssemblyAI...`);
                             const transcription = await transcribeAudio(filepath);
-                            console.log('[DEBUG] Transcription complete:', transcription);
+                            console.log(`[DEBUG] [${requestId}] Transcription complete:`, transcription);
+                            // Check if this request was cancelled or superseded
+                            if (!clientState.isProcessing || clientState.currentRequestId !== requestId) {
+                                console.log(`[DEBUG] [${requestId}] Request was cancelled/superseded, skipping...`);
+                                return;
+                            }
                             // Process the transcription with Groq LLM
                             try {
-                                console.log('[DEBUG] Starting Groq processing...');
-                                const response = await processWithGroq(transcription);
-                                console.log('[DEBUG] Groq processing complete:', response);
+                                console.log(`[DEBUG] [${requestId}] Starting Groq processing...`);
+                                const response = await processWithGroq(transcription, abortController.signal);
+                                console.log(`[DEBUG] [${requestId}] Groq processing complete:`, response);
+                                // Check if this request was cancelled or superseded after Groq
+                                if (!clientState.isProcessing || clientState.currentRequestId !== requestId) {
+                                    console.log(`[DEBUG] [${requestId}] Request was cancelled/superseded after Groq, skipping TTS...`);
+                                    return;
+                                }
                                 // Convert the response to speech
                                 try {
-                                    console.log('[DEBUG] Starting text-to-speech conversion...');
+                                    console.log(`[DEBUG] [${requestId}] Starting text-to-speech conversion...`);
+                                    clientState.currentTTSGeneration = 'active'; // Mark TTS as active
                                     const speechAudio = await convertTextToSpeech(response);
-                                    console.log('[DEBUG] Text-to-speech conversion complete');
+                                    // Final check if still the current request
+                                    if (!clientState.isProcessing || clientState.currentRequestId !== requestId || !clientState.currentTTSGeneration) {
+                                        console.log(`[DEBUG] [${requestId}] Request was cancelled/superseded during TTS, not sending audio`);
+                                        return;
+                                    }
+                                    console.log(`[DEBUG] [${requestId}] Text-to-speech conversion complete`);
                                     // Send success response back to client with transcription, response, and audio
                                     ws.send(JSON.stringify({
                                         type: 'audio_received',
@@ -244,55 +356,111 @@ wss.on('connection', (ws) => {
                                         transcription: transcription,
                                         response: response,
                                         speechAudio: speechAudio,
-                                        filename: filename
+                                        filename: filename,
+                                        requestId: requestId
                                     }));
-                                    console.log('[DEBUG] Sent transcription, response, and speech audio to client.');
+                                    console.log(`[DEBUG] [${requestId}] Sent transcription, response, and speech audio to client.`);
+                                    // Reset client state only if this is still the current request
+                                    if (clientState.currentRequestId === requestId) {
+                                        clientState.isProcessing = false;
+                                        clientState.currentTTSGeneration = null;
+                                        clientState.currentRequestId = null;
+                                        clientState.abortController = null;
+                                    }
                                 }
                                 catch (ttsError) {
-                                    console.error('[ERROR] Text-to-speech failed:', ttsError);
-                                    // Send response without audio if TTS fails
-                                    ws.send(JSON.stringify({
-                                        type: 'audio_received',
-                                        message: 'Voice processed successfully (no audio)',
-                                        transcription: transcription,
-                                        response: response,
-                                        filename: filename
-                                    }));
+                                    if (ttsError.message === 'Request cancelled') {
+                                        console.log(`[DEBUG] [${requestId}] TTS was cancelled`);
+                                        return;
+                                    }
+                                    console.error(`[ERROR] [${requestId}] Text-to-speech failed:`, ttsError);
+                                    // Reset state only if this is still the current request
+                                    if (clientState.currentRequestId === requestId) {
+                                        clientState.isProcessing = false;
+                                        clientState.currentTTSGeneration = null;
+                                        clientState.currentRequestId = null;
+                                        clientState.abortController = null;
+                                        // Send response without audio if TTS fails
+                                        ws.send(JSON.stringify({
+                                            type: 'audio_received',
+                                            message: 'Voice processed successfully (no audio)',
+                                            transcription: transcription,
+                                            response: response,
+                                            filename: filename,
+                                            requestId: requestId
+                                        }));
+                                    }
                                 }
                             }
                             catch (groqError) {
-                                console.error('[ERROR] Groq processing failed:', groqError);
-                                ws.send(JSON.stringify({
-                                    type: 'audio_received',
-                                    message: 'Error during Groq processing: ' + (groqError.message || groqError),
-                                    error: true
-                                }));
+                                if (groqError.message === 'Request cancelled') {
+                                    console.log(`[DEBUG] [${requestId}] Groq request was cancelled`);
+                                    return;
+                                }
+                                console.error(`[ERROR] [${requestId}] Groq processing failed:`, groqError);
+                                // Reset state only if this is still the current request
+                                if (clientState.currentRequestId === requestId) {
+                                    clientState.isProcessing = false;
+                                    clientState.currentTTSGeneration = null;
+                                    clientState.currentRequestId = null;
+                                    clientState.abortController = null;
+                                    ws.send(JSON.stringify({
+                                        type: 'audio_received',
+                                        message: 'Error during Groq processing: ' + (groqError.message || groqError),
+                                        error: true,
+                                        requestId: requestId
+                                    }));
+                                }
                             }
                         }
                         catch (transcriptionError) {
-                            console.error('[ERROR] AssemblyAI transcription failed:', transcriptionError);
-                            ws.send(JSON.stringify({
-                                type: 'audio_received',
-                                message: 'Error during transcription: ' + (transcriptionError.message || transcriptionError),
-                                error: true
-                            }));
+                            console.error(`[ERROR] [${requestId}] AssemblyAI transcription failed:`, transcriptionError);
+                            // Reset state only if this is still the current request
+                            if (clientState.currentRequestId === requestId) {
+                                clientState.isProcessing = false;
+                                clientState.currentTTSGeneration = null;
+                                clientState.currentRequestId = null;
+                                clientState.abortController = null;
+                                ws.send(JSON.stringify({
+                                    type: 'audio_received',
+                                    message: 'Error during transcription: ' + (transcriptionError.message || transcriptionError),
+                                    error: true,
+                                    requestId: requestId
+                                }));
+                            }
                         }
                     }
                     else {
-                        console.log('[ERROR] No audio data received');
+                        console.log(`[ERROR] [${requestId}] No audio data received`);
+                        // Reset state
+                        if (clientState.currentRequestId === requestId) {
+                            clientState.isProcessing = false;
+                            clientState.currentTTSGeneration = null;
+                            clientState.currentRequestId = null;
+                            clientState.abortController = null;
+                        }
                         ws.send(JSON.stringify({
                             type: 'audio_received',
                             message: 'Error: No audio data received',
-                            error: true
+                            error: true,
+                            requestId: requestId
                         }));
                     }
                 }
                 catch (error) {
-                    console.error('[ERROR] Error processing audio:', error);
+                    console.error(`[ERROR] [${requestId}] Error processing audio:`, error);
+                    // Reset state
+                    if (clientState.currentRequestId === requestId) {
+                        clientState.isProcessing = false;
+                        clientState.currentTTSGeneration = null;
+                        clientState.currentRequestId = null;
+                        clientState.abortController = null;
+                    }
                     ws.send(JSON.stringify({
                         type: 'audio_received',
                         message: 'Error processing audio: ' + (error.message || error),
-                        error: true
+                        error: true,
+                        requestId: requestId
                     }));
                 }
                 break;
@@ -302,10 +470,18 @@ wss.on('connection', (ws) => {
     }
     ws.on('close', () => {
         console.log('WebSocket connection closed');
+        const clientState = clients.get(ws);
+        if (clientState?.abortController) {
+            clientState.abortController.abort();
+        }
         clients.delete(ws);
     });
     ws.on('error', (error) => {
         console.error('WebSocket error:', error);
+        const clientState = clients.get(ws);
+        if (clientState?.abortController) {
+            clientState.abortController.abort();
+        }
         clients.delete(ws);
     });
     // Send welcome message

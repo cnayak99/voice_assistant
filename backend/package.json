@@ -25,5 +25,12 @@
     "groq-sdk": "^0.26.0",
     "openai": "^5.8.2",
     "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/dotenv": "^8.2.3",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.8",
+    "@types/ws": "^8.18.1"
   }
 }

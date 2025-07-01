@@ -1,4 +1,4 @@
-import { StyleSheet, TouchableOpacity, View, Alert } from 'react-native';
+import { StyleSheet, TouchableOpacity, View, Alert, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { Audio } from 'expo-av';
 import { useState, useEffect, useRef } from 'react';
@@ -15,6 +15,8 @@ export default function HomeScreen() {
   const [transcription, setTranscription] = useState<string>('');
   const [groqResponse, setGroqResponse] = useState<string>('');
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const [aiState, setAiState] = useState<'idle' | 'processing' | 'speaking'>('idle');
+  const [currentRequestId, setCurrentRequestId] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
@@ -43,7 +45,6 @@ export default function HomeScreen() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          console.log('Received from backend:', data);
           
           switch (data.type) {
             case 'connection_established':
@@ -57,7 +58,17 @@ export default function HomeScreen() {
               break;
             case 'audio_received':
               console.log('Backend received audio:', data.message);
+              console.log('Response request ID:', data.requestId);
+              console.log('Current request ID:', currentRequestId);
+              
+              // Only process this response if it matches the current request ID
+              if (data.requestId && currentRequestId && data.requestId !== currentRequestId) {
+                console.log('🚫 Ignoring response from old/cancelled request:', data.requestId);
+                return;
+              }
+              
               setIsProcessing(false);
+              setAiState('idle');
               if (data.error) {
                 setTranscription('');
                 setGroqResponse('');
@@ -70,11 +81,22 @@ export default function HomeScreen() {
                   setGroqResponse(data.response);
                 }
                 if (data.speechAudio) {
-                  // Play the audio response
+                  // Only play audio if this is still the current request
+                  console.log('✅ Playing audio for current request:', data.requestId);
+                  setAiState('speaking');
                   playAudioResponse(data.speechAudio);
                 }
                 Alert.alert('Success', data.message);
               }
+              break;
+            case 'ai_interrupted':
+              console.log('AI response interrupted');
+              setAiState('idle');
+              setIsPlayingAudio(false);
+              break;
+            case 'processing_started':
+              console.log('Backend started processing');
+              setAiState('processing');
               break;
             default:
               console.log('Unknown message type from backend:', data.type);
@@ -144,6 +166,9 @@ export default function HomeScreen() {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false, // Keep loudspeaker preference
       });
 
       const { recording } = await Audio.Recording.createAsync(
@@ -151,8 +176,8 @@ export default function HomeScreen() {
       );
       recordingRef.current = recording;
       setIsRecording(true);
-      sendWebSocketMessage('voice_start');
-      console.log('Recording started');
+      sendWebSocketMessage('start_listening');
+      console.log('Recording started - hold to continue');
     } catch (error) {
       console.error('Failed to start recording:', error);
       Alert.alert('Error', 'Failed to start recording');
@@ -164,11 +189,11 @@ export default function HomeScreen() {
 
     try {
       setIsProcessing(true);
-      sendWebSocketMessage('voice_stop');
+      sendWebSocketMessage('stop_listening');
       
       await recordingRef.current.stopAndUnloadAsync();
       const uri = recordingRef.current.getURI();
-      console.log('Recording URI:', uri);
+      console.log('Recording completed, URI:', uri);
       recordingRef.current = null;
       setIsRecording(false);
 
@@ -185,6 +210,11 @@ export default function HomeScreen() {
   const sendAudioToBackend = async (audioUri: string) => {
     try {
       console.log('Reading audio file from:', audioUri);
+      
+      // Generate unique request ID
+      const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      setCurrentRequestId(requestId);
+      console.log('🎯 Starting new request:', requestId);
       
       // Read the audio file
       const audioData = await FileSystem.readAsStringAsync(audioUri, {
@@ -203,7 +233,8 @@ export default function HomeScreen() {
           duration: 0,
           format: 'm4a',
           sampleRate: 44100,
-          channels: 1
+          channels: 1,
+          requestId: requestId  // Include request ID
         });
         
         console.log('Message type:', typeof message);
@@ -224,7 +255,8 @@ export default function HomeScreen() {
     }
   };
 
-  const handleVoiceButtonPress = async () => {
+  // Hold-to-talk: Press down to start, release to stop
+  const handleButtonPressIn = async () => {
     if (hasPermission === null) {
       return;
     }
@@ -234,10 +266,69 @@ export default function HomeScreen() {
       return;
     }
 
-    if (!isRecording) {
-      await startRecording();
-    } else {
+    // IMMEDIATELY stop any playing audio - do this FIRST and synchronously
+    if (soundRef.current) {
+      try {
+        soundRef.current.stopAsync(); // Don't await - stop immediately
+        soundRef.current.unloadAsync(); // Don't await - unload immediately
+        soundRef.current = null;
+        console.log('Audio stopped immediately on button press');
+      } catch (error) {
+        console.error('Error stopping audio immediately:', error);
+      }
+    }
+
+    // If AI is speaking or processing, interrupt it
+    if (aiState === 'speaking') {
+      console.log('Interrupting AI speech');
+      // Immediately update state to prevent any race conditions
+      setAiState('idle');
+      setIsPlayingAudio(false);
+      setCurrentRequestId(null); // Clear current request ID
+      // Tell backend to interrupt
+      sendWebSocketMessage('interrupt_ai');
+    } else if (aiState === 'processing') {
+      console.log('Interrupting AI processing');
+      // Tell backend to cancel processing
+      sendWebSocketMessage('cancel_processing');
+      // Immediately update state
+      setIsProcessing(false);
+      setAiState('idle');
+      setCurrentRequestId(null); // Clear current request ID
+    }
+
+    // Start recording (this will now happen after interrupt cleanup)
+    await startRecording();
+  };
+
+  const handleButtonPressOut = async () => {
+    if (isRecording) {
       await stopRecording();
+    }
+  };
+
+  // Function to stop current audio playback
+  const stopAudioPlayback = async () => {
+    try {
+      console.log('Stopping audio playback...');
+      // Immediately update states first
+      setIsPlayingAudio(false);
+      setAiState('idle');
+      
+      if (soundRef.current) {
+        // Stop and unload without awaiting for immediate effect
+        soundRef.current.stopAsync();
+        soundRef.current.unloadAsync();
+        soundRef.current = null;
+        console.log('Audio stopped and unloaded successfully');
+      }
+      console.log('Audio playback stopped');
+    } catch (error) {
+      console.error('Error stopping audio:', error);
+      // Even if there's an error, reset the state
+      setIsPlayingAudio(false);
+      setAiState('idle');
+      soundRef.current = null;
     }
   };
 
@@ -246,6 +337,15 @@ export default function HomeScreen() {
     try {
       setIsPlayingAudio(true);
       console.log('Playing audio response...');
+      
+      // Set audio mode to use loudspeaker
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false, // Force loudspeaker on Android
+      });
       
       // Create a temporary file for the audio
       const audioUri = FileSystem.documentDirectory + 'response_audio.mp3';
@@ -258,7 +358,11 @@ export default function HomeScreen() {
       // Load and play the audio
       const { sound } = await Audio.Sound.createAsync(
         { uri: audioUri },
-        { shouldPlay: true }
+        { 
+          shouldPlay: true,
+          volume: 1.0,
+          isMuted: false,
+        }
       );
       
       soundRef.current = sound;
@@ -267,13 +371,16 @@ export default function HomeScreen() {
       sound.setOnPlaybackStatusUpdate((status) => {
         if (status.isLoaded && status.didJustFinish) {
           setIsPlayingAudio(false);
+          setAiState('idle');
           sound.unloadAsync();
+          soundRef.current = null;
         }
       });
       
     } catch (error) {
       console.error('Error playing audio:', error);
       setIsPlayingAudio(false);
+      setAiState('idle');
       Alert.alert('Audio Error', 'Failed to play audio response');
     }
   };
@@ -286,13 +393,14 @@ export default function HomeScreen() {
         <ThemedText style={styles.headerTextBold}>Voice Assistant</ThemedText>
       </ThemedView>
       
-      {/* Voice Assistant Button */}
-      <View style={styles.buttonContainer}>
+      {/* Fixed Button Container */}
+      <View style={styles.fixedButtonContainer}>
         <TouchableOpacity 
           style={[styles.voiceButton, isRecording && styles.voiceButtonRecording]} 
           activeOpacity={0.8}
-          onPress={handleVoiceButtonPress}
-          disabled={isProcessing}
+          onPressIn={handleButtonPressIn}
+          onPressOut={handleButtonPressOut}
+          disabled={isProcessing && aiState !== 'speaking'}
         >
           <View style={[styles.buttonInner, isRecording && styles.buttonInnerRecording]}>
             <Ionicons 
@@ -310,16 +418,24 @@ export default function HomeScreen() {
             ? 'Checking permissions...' 
             : hasPermission === false 
             ? 'Tap to grant microphone permission' 
-            : isProcessing
-            ? 'Processing audio...'
-            : isPlayingAudio
-            ? 'Playing response...'
+            : aiState === 'processing'
+            ? 'AI is thinking... (hold to interrupt)'
+            : aiState === 'speaking'
+            ? 'AI is speaking... (hold to interrupt)'
             : isRecording 
-            ? 'Recording... Tap to stop' 
-            : 'Tap to start voice assistant'
+            ? 'Recording... Release to send' 
+            : 'Hold to talk to AI assistant'
           }
         </ThemedText>
-        
+      </View>
+      
+      {/* Scrollable Content Container */}
+      <ScrollView 
+        style={styles.scrollableContent}
+        contentContainerStyle={styles.scrollableContentContainer}
+        showsVerticalScrollIndicator={true}
+        bounces={true}
+      >
         {/* Transcription Result */}
         {transcription ? (
           <ThemedView style={styles.resultContainer}>
@@ -340,7 +456,10 @@ export default function HomeScreen() {
         <ThemedText style={[styles.connectionStatus, { color: isConnected ? '#34C759' : '#FF3B30' }]}>
           {isConnected ? '🟢 Connected to backend' : '🔴 Disconnected from backend'}
         </ThemedText>
-      </View>
+        
+        {/* Bottom padding to ensure content doesn't get cut off */}
+        <View style={styles.bottomPadding} />
+      </ScrollView>
     </ThemedView>
   );
 }
@@ -372,10 +491,11 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 2 },
     textShadowRadius: 4,
   },
-  buttonContainer: {
-    flex: 1,
-    justifyContent: 'center',
+  fixedButtonContainer: {
+    paddingVertical: 20,
+    paddingHorizontal: 20,
     alignItems: 'center',
+    backgroundColor: 'transparent',
   },
   voiceButton: {
     width: 120,
@@ -426,8 +546,15 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     paddingHorizontal: 20,
   },
+  scrollableContent: {
+    flex: 1,
+  },
+  scrollableContentContainer: {
+    padding: 20,
+    paddingTop: 10,
+  },
   connectionStatus: {
-    marginTop: 10,
+    marginTop: 20,
     fontSize: 14,
     textAlign: 'center',
     paddingHorizontal: 20,
@@ -437,14 +564,14 @@ const styles = StyleSheet.create({
     padding: 15,
     borderRadius: 10,
     backgroundColor: 'rgba(0, 122, 255, 0.1)',
-    width: '90%',
+    width: '100%',
   },
   responseContainer: {
     marginTop: 15,
     padding: 15,
     borderRadius: 10,
     backgroundColor: 'rgba(52, 199, 89, 0.1)',
-    width: '90%',
+    width: '100%',
   },
   resultLabel: {
     fontSize: 16,
@@ -461,5 +588,8 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 24,
     fontWeight: '500',
+  },
+  bottomPadding: {
+    height: 20,
   },
 });
