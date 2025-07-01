@@ -422,13 +422,190 @@ class AudioStreamProcessor {
   private readonly maxBufferSize = 30; // Increased from 20 to capture even longer statements
   private readonly silenceTimeoutMs = 3000; // Increased from 2000 to allow for longer pauses
   private readonly forceProcessTimeoutMs = 15000; // Increased from 10000 to allow for even longer statements
-  private readonly energyThreshold = 0.005; // Lowered threshold for better voice detection
+  private readonly energyThreshold = 0.05; // Increased threshold to better distinguish voice from background noise
   private vadActive: boolean = false;
   private lastVoiceActivityTime = 0;
   private voiceActivityState: 'SILENCE' | 'SPEAKING' = 'SILENCE';
   
+  // Track energy levels for dynamic threshold adjustment
+  private recentEnergyLevels: number[] = [];
+  private readonly maxEnergyHistorySize = 50;
+  
   constructor(clientState: ClientState) {
     this.clientState = clientState;
+  }
+  
+  // Method to adjust VAD threshold dynamically based on recent audio
+  public adjustVADThreshold(): number {
+    if (this.recentEnergyLevels.length < 10) {
+      // Not enough data to adjust threshold
+      return this.energyThreshold;
+    }
+    
+    // Sort energy levels and find the noise floor (25th percentile)
+    const sortedLevels = [...this.recentEnergyLevels].sort((a, b) => a - b);
+    const noiseFloorIndex = Math.floor(sortedLevels.length * 0.25);
+    const noiseFloor = sortedLevels[noiseFloorIndex];
+    
+    // Find the median energy level (50th percentile)
+    const medianIndex = Math.floor(sortedLevels.length * 0.5);
+    const medianEnergy = sortedLevels[medianIndex];
+    
+    // Set threshold to be between noise floor and median
+    // This adapts to the current audio environment
+    const dynamicThreshold = noiseFloor + ((medianEnergy - noiseFloor) * 0.5);
+    
+    // Ensure threshold is within reasonable bounds
+    const minThreshold = 0.003;
+    const maxThreshold = 0.02;
+    const boundedThreshold = Math.max(minThreshold, Math.min(maxThreshold, dynamicThreshold));
+    
+    console.log(`[VAD] Dynamic threshold: ${boundedThreshold.toFixed(4)} (noise: ${noiseFloor.toFixed(4)}, median: ${medianEnergy.toFixed(4)})`);
+    
+    return boundedThreshold;
+  }
+  
+  // Method to visualize the energy distribution and threshold
+  public visualizeEnergyDistribution(): void {
+    if (this.recentEnergyLevels.length < 5) {
+      return; // Not enough data to visualize
+    }
+    
+    const min = Math.min(...this.recentEnergyLevels);
+    const max = Math.max(...this.recentEnergyLevels);
+    const range = max - min;
+    
+    // Create 10 buckets for histogram
+    const buckets = new Array(10).fill(0);
+    
+    // Populate buckets
+    this.recentEnergyLevels.forEach(energy => {
+      if (range === 0) return; // Avoid division by zero
+      const bucketIndex = Math.min(9, Math.floor(((energy - min) / range) * 10));
+      buckets[bucketIndex]++;
+    });
+    
+    // Find the current threshold position in the histogram
+    const thresholdBucket = range === 0 ? 0 : 
+      Math.min(9, Math.floor(((this.energyThreshold - min) / range) * 10));
+    
+    // Create visualization
+    console.log('[VAD] Energy distribution:');
+    const maxCount = Math.max(...buckets);
+    
+    for (let i = 9; i >= 0; i--) {
+      const barLength = Math.round((buckets[i] / maxCount) * 20);
+      const bar = '█'.repeat(barLength) + ' '.repeat(20 - barLength);
+      
+      const energyValue = min + ((i + 0.5) / 10) * range;
+      const isThresholdBar = i === thresholdBucket;
+      
+      console.log(`${energyValue.toFixed(4)} ${isThresholdBar ? '|>' : '| '} ${bar} ${buckets[i]}`);
+    }
+    
+    console.log(`[VAD] Threshold: ${this.energyThreshold.toFixed(4)}, Range: ${min.toFixed(4)}-${max.toFixed(4)}`);
+  }
+  
+  // Method to analyze frequency characteristics of audio
+  private analyzeFrequencyCharacteristics(audioData: Buffer): {
+    isLikelyVoice: boolean;
+    lowEnergy: number;
+    midEnergy: number;
+    highEnergy: number;
+    voiceConfidence: number;
+  } {
+    try {
+      // This is a simplified frequency analysis that works directly on raw audio bytes
+      // It divides the audio into segments and analyzes energy in different "frequency bands"
+      // by looking at the rate of change between samples
+      
+      if (audioData.length < 100) {
+        return { isLikelyVoice: false, lowEnergy: 0, midEnergy: 0, highEnergy: 0, voiceConfidence: 0 };
+      }
+      
+      const centerValue = 128; // Center value for unsigned 8-bit audio
+      let lowBandEnergy = 0;   // Approximates 0-500Hz
+      let midBandEnergy = 0;   // Approximates 500-2000Hz (where most speech is)
+      let highBandEnergy = 0;  // Approximates 2000+Hz
+      
+      // Calculate differences between consecutive samples at different intervals
+      // This roughly approximates different frequency bands
+      
+      // Low frequencies - changes between samples far apart
+      for (let i = 20; i < audioData.length; i += 3) {
+        const diff = Math.abs(audioData[i] - audioData[i - 20]);
+        lowBandEnergy += diff * diff;
+      }
+      
+      // Mid frequencies - changes between samples at medium distance
+      for (let i = 8; i < audioData.length; i += 2) {
+        const diff = Math.abs(audioData[i] - audioData[i - 8]);
+        midBandEnergy += diff * diff;
+      }
+      
+      // High frequencies - changes between adjacent samples
+      for (let i = 1; i < audioData.length; i += 1) {
+        const diff = Math.abs(audioData[i] - audioData[i - 1]);
+        highBandEnergy += diff * diff;
+      }
+      
+      // Normalize energies
+      const sampleCount = audioData.length;
+      lowBandEnergy = Math.sqrt(lowBandEnergy / (sampleCount / 3)) / centerValue;
+      midBandEnergy = Math.sqrt(midBandEnergy / (sampleCount / 2)) / centerValue;
+      highBandEnergy = Math.sqrt(highBandEnergy / sampleCount) / centerValue;
+      
+      // Human speech typically has stronger mid-frequency energy
+      // Calculate several metrics to determine if this is likely human speech
+      
+      // 1. Mid-band dominance (human speech has strong mid-frequencies)
+      const totalEnergy = lowBandEnergy + midBandEnergy + highBandEnergy + 0.0001;
+      const midBandRatio = midBandEnergy / totalEnergy;
+      
+      // 2. High-to-low ratio (speech typically has more high than very low frequencies)
+      const highToLowRatio = highBandEnergy / (lowBandEnergy + 0.0001);
+      
+      // 3. Energy variation (speech has more variation than constant background noise)
+      // Calculate standard deviation of sample differences as a measure of variation
+      let sumDiffs = 0;
+      let sumDiffsSq = 0;
+      let count = 0;
+      
+      for (let i = 10; i < audioData.length; i += 10) {
+        const diff = Math.abs(audioData[i] - audioData[i - 10]);
+        sumDiffs += diff;
+        sumDiffsSq += diff * diff;
+        count++;
+      }
+      
+      const meanDiff = count > 0 ? sumDiffs / count : 0;
+      const stdDevDiff = count > 0 ? 
+        Math.sqrt((sumDiffsSq / count) - (meanDiff * meanDiff)) : 0;
+      
+      // Normalize standard deviation
+      const normalizedStdDev = stdDevDiff / centerValue;
+      
+      // Calculate voice confidence score (0-1) based on these metrics
+      const midBandScore = Math.min(1, midBandRatio * 2); // Weight mid-band importance
+      const variationScore = Math.min(1, normalizedStdDev * 10); // Weight variation
+      
+      // Combined voice confidence score
+      const voiceConfidence = (midBandScore * 0.6) + (variationScore * 0.4);
+      
+      // Determine if this is likely voice based on confidence threshold
+      const isLikelyVoice = voiceConfidence > 0.4 && midBandEnergy > 0.1;
+      
+      return {
+        isLikelyVoice,
+        lowEnergy: lowBandEnergy,
+        midEnergy: midBandEnergy,
+        highEnergy: highBandEnergy,
+        voiceConfidence
+      };
+    } catch (error) {
+      console.error('[ERROR] Error analyzing frequency characteristics:', error);
+      return { isLikelyVoice: false, lowEnergy: 0, midEnergy: 0, highEnergy: 0, voiceConfidence: 0 };
+    }
   }
   
   public addChunk(chunk: Buffer, sequence: number, timestamp: number): void {
@@ -506,39 +683,124 @@ class AudioStreamProcessor {
       let totalEnergy = 0;
       const centerValue = 128; // Center value for unsigned 8-bit audio
       
+      // Calculate min, max, and histogram for visualization
+      let minValue = 255;
+      let maxValue = 0;
+      const histogram = new Array(10).fill(0); // 10 energy level buckets
+      
       // Process each byte as an unsigned 8-bit sample
       for (let i = 0; i < audioData.length; i++) {
+        const value = audioData[i];
+        
+        // Track min/max values
+        if (value < minValue) minValue = value;
+        if (value > maxValue) maxValue = value;
+        
         // Calculate distance from center (128) as a measure of energy
-        const distance = Math.abs(audioData[i] - centerValue);
+        const distance = Math.abs(value - centerValue);
         totalEnergy += distance * distance;
+        
+        // Add to histogram (every 100th sample to avoid excessive computation)
+        if (i % 100 === 0) {
+          const bucketIndex = Math.min(9, Math.floor(distance / 25)); // 0-9 buckets
+          histogram[bucketIndex]++;
+        }
       }
       
       // Calculate RMS (root mean square) energy
       const rms = Math.sqrt(totalEnergy / audioData.length) / centerValue;
       
-      // Threshold for voice activity detection - LOWERED for more sensitivity
-      const ENERGY_THRESHOLD = 0.01; // Lower threshold to detect more speech
+      // Add to recent energy levels for dynamic threshold adjustment
+      this.recentEnergyLevels.push(rms);
+      if (this.recentEnergyLevels.length > this.maxEnergyHistorySize) {
+        this.recentEnergyLevels.shift(); // Remove oldest entry
+      }
       
-      // Update VAD state
+      // Use dynamic threshold if we have enough data
+      const currentThreshold = this.recentEnergyLevels.length >= 10 ? 
+        this.adjustVADThreshold() : this.energyThreshold;
+      
+      // Analyze frequency characteristics
+      const freqAnalysis = this.analyzeFrequencyCharacteristics(audioData);
+      
+      // Determine if this is voice using both energy and frequency characteristics
+      const energyDetectedVoice = rms > currentThreshold;
+      const freqDetectedVoice = freqAnalysis.isLikelyVoice;
+      
+      // Combined detection with stricter requirements to avoid false positives
+      // Require EITHER:
+      // 1. Energy above threshold AND some voice confidence, OR
+      // 2. High voice confidence even with slightly lower energy
       const previousVadActive = this.vadActive;
-      this.vadActive = rms > ENERGY_THRESHOLD;
+      this.vadActive = (energyDetectedVoice && freqAnalysis.voiceConfidence > 0.2) || 
+                      (rms > currentThreshold * 0.7 && freqAnalysis.voiceConfidence > 0.5);
+      
+      // Create ASCII visualization of energy levels
+      const energyPercentage = Math.min(100, Math.round(rms * 1000));
+      const energyBar = '█'.repeat(Math.floor(energyPercentage / 5)) + '░'.repeat(20 - Math.floor(energyPercentage / 5));
+      const thresholdPosition = Math.floor((currentThreshold * 1000) / 5);
+      const thresholdBar = ' '.repeat(thresholdPosition) + '|' + ' '.repeat(20 - thresholdPosition);
+      
+      // Log detailed VAD information for every chunk
+      console.log(`[VAD] Chunk energy: ${rms.toFixed(4)} | Threshold: ${currentThreshold.toFixed(4)} | Speaking: ${this.vadActive ? 'YES' : 'NO'}`);
+      console.log(`[VAD] Energy level: [${energyBar}] ${energyPercentage}%`);
+      console.log(`[VAD] Threshold:    [${thresholdBar}]`);
+      console.log(`[VAD] Audio range: min=${minValue}, max=${maxValue}, spread=${maxValue-minValue}`);
+      
+      // Log frequency analysis results
+      console.log(`[VAD] Frequency bands - Low: ${freqAnalysis.lowEnergy.toFixed(4)}, Mid: ${freqAnalysis.midEnergy.toFixed(4)}, High: ${freqAnalysis.highEnergy.toFixed(4)}`);
+      console.log(`[VAD] Voice confidence: ${(freqAnalysis.voiceConfidence * 100).toFixed(1)}%, Likely voice: ${freqAnalysis.isLikelyVoice ? 'YES' : 'NO'}`);
+      
+      // Create frequency band visualization
+      const maxFreqEnergy = Math.max(freqAnalysis.lowEnergy, freqAnalysis.midEnergy, freqAnalysis.highEnergy);
+      if (maxFreqEnergy > 0) {
+        const lowBar = '█'.repeat(Math.floor((freqAnalysis.lowEnergy / maxFreqEnergy) * 20));
+        const midBar = '█'.repeat(Math.floor((freqAnalysis.midEnergy / maxFreqEnergy) * 20));
+        const highBar = '█'.repeat(Math.floor((freqAnalysis.highEnergy / maxFreqEnergy) * 20));
+        console.log(`[VAD] Low freq:  ${lowBar}`);
+        console.log(`[VAD] Mid freq:  ${midBar} ${freqAnalysis.midEnergy > Math.max(freqAnalysis.lowEnergy, freqAnalysis.highEnergy) ? '← SPEECH' : ''}`);
+        console.log(`[VAD] High freq: ${highBar}`);
+        
+        // Add confidence visualization
+        const confidenceBar = '█'.repeat(Math.floor(freqAnalysis.voiceConfidence * 20)) + '░'.repeat(20 - Math.floor(freqAnalysis.voiceConfidence * 20));
+        console.log(`[VAD] Confidence: [${confidenceBar}] ${(freqAnalysis.voiceConfidence * 100).toFixed(1)}%`);
+      }
+      
+      // Create histogram visualization
+      const maxBucketValue = Math.max(...histogram);
+      const histogramViz = histogram.map(count => {
+        const height = Math.round((count / maxBucketValue) * 10);
+        return '█'.repeat(height) + ' '.repeat(10 - height);
+      }).join(' ');
+      console.log(`[VAD] Energy distribution: ${histogramViz}`);
+      
+      // Periodically show the energy distribution across recent history
+      if (this.recentEnergyLevels.length >= 20 && Math.random() < 0.1) {
+        this.visualizeEnergyDistribution();
+      }
       
       // Log state changes for debugging
       if (this.vadActive !== previousVadActive) {
-        console.log(`[TRACE] Voice activity changed: ${this.vadActive ? 'SPEAKING' : 'SILENT'}, energy: ${rms.toFixed(4)}`);
+        console.log(`[VAD] *** Voice activity changed: ${this.vadActive ? 'SPEAKING' : 'SILENT'} ***`);
       }
       
-      // Log energy level periodically for debugging
-      if (Math.random() < 0.1) { // Log roughly 10% of the time to avoid log spam
-        console.log(`[TRACE] Current audio energy level: ${rms.toFixed(4)}`);
-      }
-      
-      // Send VAD status to client
+      // Send VAD status to client with more detailed information
       if (this.clientState.ws.readyState === WebSocket.OPEN) {
         this.clientState.ws.send(JSON.stringify({
           type: 'vad_status',
           isSpeaking: this.vadActive,
-          audioLevel: rms // Send normalized audio level for visualization
+          audioLevel: rms,
+          threshold: currentThreshold,
+          energyPercentage: energyPercentage,
+          minValue: minValue,
+          maxValue: maxValue,
+          freqAnalysis: {
+            lowEnergy: freqAnalysis.lowEnergy,
+            midEnergy: freqAnalysis.midEnergy,
+            highEnergy: freqAnalysis.highEnergy,
+            isLikelyVoice: freqAnalysis.isLikelyVoice
+          },
+          timestamp: Date.now()
         }));
       }
     } catch (error) {
@@ -559,6 +821,62 @@ class AudioStreamProcessor {
     }
     
     console.log(`[DEBUG] Processing ${this.audioChunks.length} audio chunks for transcription`);
+    
+    // Log VAD summary for all chunks
+    const vadSummary = this.audioChunks.map((chunk, index) => {
+      // Analyze this chunk for voice activity
+      let totalEnergy = 0;
+      const centerValue = 128;
+      let voiceConfidence = 0;
+      
+      for (let i = 0; i < chunk.data.length; i++) {
+        const distance = Math.abs(chunk.data[i] - centerValue);
+        totalEnergy += distance * distance;
+      }
+      
+      const rms = Math.sqrt(totalEnergy / chunk.data.length) / centerValue;
+      
+      // Quick frequency analysis for this chunk
+      if (chunk.data.length >= 100) {
+        // Calculate mid-band energy (simplified)
+        let midBandEnergy = 0;
+        for (let i = 8; i < Math.min(1000, chunk.data.length); i += 2) {
+          const diff = Math.abs(chunk.data[i] - chunk.data[i - 8]);
+          midBandEnergy += diff * diff;
+        }
+        midBandEnergy = Math.sqrt(midBandEnergy / (Math.min(1000, chunk.data.length) / 2)) / centerValue;
+        voiceConfidence = midBandEnergy > 0.1 ? 0.5 : 0;
+      }
+      
+      const hasVoice = rms > this.energyThreshold && voiceConfidence > 0.2;
+      
+      return {
+        index,
+        energy: rms,
+        hasVoice,
+        size: chunk.data.length,
+        timestamp: chunk.timestamp
+      };
+    });
+    
+    // Print VAD summary table
+    console.log('[VAD SUMMARY] Voice activity across all chunks:');
+    console.log('┌───────┬───────────┬───────────┬────────┬─────────────────┐');
+    console.log('│ Chunk │   Energy  │ Has Voice │  Size  │    Timestamp    │');
+    console.log('├───────┼───────────┼───────────┼────────┼─────────────────┤');
+    
+          vadSummary.forEach(info => {
+      const energyBar = '█'.repeat(Math.floor(info.energy * 100));
+      const hasVoiceDisplay = info.hasVoice ? '\x1b[32mYES\x1b[0m' : '\x1b[90mNO \x1b[0m'; // Green for YES, gray for NO
+      console.log(`│ ${info.index.toString().padStart(5)} │ ${info.energy.toFixed(4).padStart(9)} │ ${hasVoiceDisplay} │ ${info.size.toString().padStart(6)} │ ${new Date(info.timestamp).toISOString().substr(11, 8)} │`);
+    });
+    
+    console.log('└───────┴───────────┴───────────┴────────┴─────────────────┘');
+    
+    // Calculate overall voice activity percentage
+    const voiceChunks = vadSummary.filter(info => info.hasVoice).length;
+    const voicePercentage = (voiceChunks / vadSummary.length) * 100;
+    console.log(`[VAD SUMMARY] Voice detected in ${voiceChunks}/${vadSummary.length} chunks (${voicePercentage.toFixed(1)}%)`);
     
     try {
       const combinedLength = this.audioChunks.reduce((total, chunk) => total + chunk.data.length, 0);
