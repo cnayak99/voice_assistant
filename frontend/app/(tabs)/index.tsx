@@ -33,7 +33,7 @@ export default function HomeScreen() {
   const connectWebSocket = () => {
     try {
       // Connect to the backend WebSocket server using computer's IP address
-      const ws = new WebSocket('ws://192.168.1.58:3001');
+      const ws = new WebSocket('ws://192.168.1.80:3001');
       
       ws.onopen = () => {
         console.log('WebSocket connected to backend');
