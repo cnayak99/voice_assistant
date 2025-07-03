@@ -1,5 +1,7 @@
 import { PermissionsAndroid, Platform } from 'react-native';
 import { CONFIG } from '../config';
+import RNFS from 'react-native-fs';
+import Sound from 'react-native-sound';
 
 // Mobile audio recorder - Better for live streaming
 let AudioRecord: any = null;
@@ -9,10 +11,15 @@ try {
   console.warn('react-native-audio-record not available');
 }
 
+// Enable playback in silence mode and through loudspeaker
+Sound.setCategory('Playback', true); // true enables mixing with other audio
+Sound.setMode('SpokenAudio'); // Optimized for speech
+
 // AI Assistant class for real-time transcription
 export class AIAssistant {
   private assemblyAIApiKey: string = CONFIG.ASSEMBLYAI_API_KEY;
   private groqApiKey: string = CONFIG.GROQ_API_KEY;
+  private elevenlabsApiKey: string = CONFIG.ELEVENLABS_API_KEY;
   
   private transcriptionSocket: WebSocket | null = null;
   private lastConnectionAttempt: number = 0;
@@ -39,8 +46,7 @@ export class AIAssistant {
   constructor(onTranscript?: (text: string, isFinal: boolean) => void) {
     this.onTranscriptCallback = onTranscript || null;
   }
-
-  // Check and request microphone permission
+  
   private async requestMicrophonePermission(): Promise<boolean> {
     try {
       if (Platform.OS === 'android') {
@@ -381,6 +387,9 @@ export class AIAssistant {
 
         // Log the AI response
         console.log(`\nAI Assistant: ${aiResponse}`);
+        
+        // Generate audio from the response
+        await this.generateAudio(aiResponse);
       } catch (error: any) {
         console.error('Error calling Groq API:', error);
         if (error.response && error.response.data) {
@@ -396,5 +405,144 @@ export class AIAssistant {
       // Restart transcription even if there was an error
       await this.startTranscription();
     }
+  }
+  
+  // Step 4: Generate audio with ElevenLabs
+  async generateAudio(text: string): Promise<void> {
+    try {
+      console.log(`\nGenerating audio for: "${text}"`);
+      
+      // Prepare request for ElevenLabs API
+      const voiceId = CONFIG.ELEVENLABS_VOICE_ID; // Rachel voice
+      const url = `${CONFIG.ELEVENLABS_API_ENDPOINT}/${voiceId}/stream`;
+      
+      const requestBody = {
+        text: text,
+        model_id: "eleven_monolingual_v1",
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75
+        }
+      };
+      
+      console.log('Calling ElevenLabs API...');
+      
+      // Make the API call to ElevenLabs
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': this.elevenlabsApiKey,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg'
+        },
+        body: JSON.stringify(requestBody)
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`ElevenLabs API error: ${response.status} - ${errorText}`);
+      }
+      
+      console.log('Audio stream received from ElevenLabs');
+      
+      // For React Native, we need to use a different approach
+      // Instead of using FileReader, we'll use direct Base64 encoding
+      
+      // Get the audio data as a blob
+      const audioBlob = await response.blob();
+      
+      // Convert blob to base64 string
+      const fileReaderInstance = new FileReader();
+      fileReaderInstance.readAsDataURL(audioBlob);
+      
+      fileReaderInstance.onload = async () => {
+        try {
+          const base64data = fileReaderInstance.result as string;
+          // Remove the data URL prefix (e.g., "data:audio/mpeg;base64,")
+          const base64Audio = base64data.split(',')[1];
+          
+          // Create a temporary file path
+          const tempDir = RNFS.CachesDirectoryPath;
+          const tempFilePath = `${tempDir}/temp_audio_${Date.now()}.mp3`;
+          
+          console.log('Writing audio to file:', tempFilePath);
+          
+          // Write the file
+          await RNFS.writeFile(tempFilePath, base64Audio, 'base64');
+          console.log('Audio file created:', tempFilePath);
+          
+          // Play the audio
+          await this.playAudioFile(tempFilePath);
+          
+        } catch (error) {
+          console.error('Error processing audio:', error);
+        }
+      };
+      
+      fileReaderInstance.onerror = (error) => {
+        console.error('Error reading audio data:', error);
+      };
+      
+    } catch (error) {
+      console.error('Error generating audio:', error);
+    }
+  }
+  
+  // Helper method to play audio file through loudspeaker
+  private async playAudioFile(filePath: string): Promise<void> {
+    try {
+      console.log('🔊 Playing audio through loudspeaker:', filePath);
+      
+      // Check if file exists first
+      const fileExists = await RNFS.exists(filePath);
+      if (!fileExists) {
+        console.error('Audio file does not exist:', filePath);
+        return;
+      }
+      
+      const fileStats = await RNFS.stat(filePath);
+      console.log('Audio file size:', fileStats.size, 'bytes');
+      
+      // Create Sound instance - using absolute path
+      const sound = new Sound(filePath, undefined, (error) => {
+        if (error) {
+          console.error('Failed to load the sound:', error);
+          this.cleanupAudioFile(filePath);
+          return;
+        }
+        
+        console.log('✅ Audio loaded successfully');
+        console.log(`🎵 Duration: ${sound.getDuration().toFixed(2)} seconds`);
+        
+        // Set volume to maximum for loudspeaker playback
+        sound.setVolume(1.0);
+        
+        // Play the sound through loudspeaker
+        sound.play((success) => {
+          if (success) {
+            console.log('🎵 Audio playback completed successfully');
+          } else {
+            console.log('❌ Audio playback failed');
+          }
+          
+          // Release the audio player resource
+          sound.release();
+          
+          // Clean up the temporary file
+          this.cleanupAudioFile(filePath);
+        });
+      });
+      
+    } catch (error) {
+      console.error('Error playing audio:', error);
+      this.cleanupAudioFile(filePath);
+    }
+  }
+  
+  // Helper method to clean up temporary audio files
+  private cleanupAudioFile(filePath: string): void {
+    RNFS.unlink(filePath)
+      .then(() => console.log('Temporary audio file deleted'))
+      .catch((err) => console.error('Error deleting temporary file:', err));
   }
 }
