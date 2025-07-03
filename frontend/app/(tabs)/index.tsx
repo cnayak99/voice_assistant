@@ -46,7 +46,7 @@ export default function HomeScreen() {
 
   const connectWebSocket = () => {
     try {
-      const ws = new WebSocket('ws://192.168.1.80:3001');
+      const ws = new WebSocket('ws://192.168.1.80:3000');
       
       ws.onopen = () => {
         console.log('WebSocket connection established');
@@ -796,6 +796,11 @@ export default function HomeScreen() {
           console.log('Call session ended');
           setCallActive(false);
           setCallSessionId(null);
+          break;
+          
+        case 'connection_established':
+          console.log('WebSocket connection confirmed:', data.message);
+          setIsConnected(true);
           break;
           
         case 'heartbeat':

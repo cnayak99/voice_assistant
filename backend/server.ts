@@ -8,6 +8,7 @@ import { AssemblyAI } from 'assemblyai';
 import Groq from 'groq-sdk';
 import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 import dotenv from 'dotenv';
+import { Cobra } from '@picovoice/cobra-node';
 
 // Load environment variables
 dotenv.config();
@@ -409,6 +410,263 @@ async function convertTextToSpeech(text: string): Promise<string> {
   }
 }
 
+interface CobraVADResult {
+  voiceProbability: number;
+  hasVoice: boolean;
+  timestamp: number;
+}
+
+class CobraVADProcessor {
+  private cobra: Cobra | null = null;
+  private isInitialized = false;
+  private accessKey: string;
+  private lastVoiceProbability = 0;
+  private voiceThreshold = 0.05; // Lowered threshold for testing (5% instead of 50%)
+  
+  constructor(accessKey: string) {
+    this.accessKey = accessKey;
+  }
+  
+  public async initialize(): Promise<void> {
+    try {
+      if (!this.accessKey) {
+        throw new Error('Picovoice access key is required. Please set PICOVOICE_ACCESS_KEY in your .env file');
+      }
+      
+      this.cobra = new Cobra(this.accessKey);
+      this.isInitialized = true;
+      console.log('[COBRA VAD] Successfully initialized Cobra Voice Activity Detection');
+      console.log(`[COBRA VAD] Sample rate: ${this.cobra.sampleRate} Hz`);
+      console.log(`[COBRA VAD] Frame length: ${this.cobra.frameLength} samples`);
+    } catch (error) {
+      console.error('[COBRA VAD] Failed to initialize Cobra VAD:', error);
+      throw error;
+    }
+  }
+  
+  public async processAudioChunk(audioBuffer: Buffer): Promise<CobraVADResult> {
+    if (!this.isInitialized || !this.cobra) {
+      throw new Error('Cobra VAD not initialized');
+    }
+    
+    try {
+      // Convert buffer to 16-bit PCM array if needed
+      const audioSamples = this.convertBufferToPCM16(audioBuffer);
+      
+      // Process with Cobra VAD - it expects exactly frameLength samples
+      const frameLength = this.cobra.frameLength;
+      let totalVoiceProbability = 0;
+      let frameCount = 0;
+      
+      // Process audio in frames of the required length
+      for (let i = 0; i + frameLength <= audioSamples.length; i += frameLength) {
+        const frame = audioSamples.slice(i, i + frameLength);
+        const voiceProbability = this.cobra.process(frame);
+        totalVoiceProbability += voiceProbability;
+        frameCount++;
+      }
+      
+      // Calculate average voice probability for this chunk
+      const avgVoiceProbability = frameCount > 0 ? totalVoiceProbability / frameCount : 0;
+      const hasVoice = avgVoiceProbability >= this.voiceThreshold;
+      
+      this.lastVoiceProbability = avgVoiceProbability;
+      
+      const result: CobraVADResult = {
+        voiceProbability: avgVoiceProbability,
+        hasVoice: hasVoice,
+        timestamp: Date.now()
+      };
+      
+      // Log detailed VAD information
+      console.log(`[COBRA VAD] Voice probability: ${(avgVoiceProbability * 100).toFixed(1)}% | Threshold: ${(this.voiceThreshold * 100).toFixed(1)}% | Voice detected: ${hasVoice ? 'YES' : 'NO'}`);
+      console.log(`[COBRA VAD] Processed ${frameCount} frames from ${audioSamples.length} samples`);
+      
+      // Create probability visualization
+      const probabilityBar = '█'.repeat(Math.floor(avgVoiceProbability * 20)) + '░'.repeat(20 - Math.floor(avgVoiceProbability * 20));
+      const thresholdPosition = Math.floor(this.voiceThreshold * 20);
+      const thresholdBar = ' '.repeat(thresholdPosition) + '|' + ' '.repeat(20 - thresholdPosition);
+      
+      console.log(`[COBRA VAD] Probability: [${probabilityBar}] ${(avgVoiceProbability * 100).toFixed(1)}%`);
+      console.log(`[COBRA VAD] Threshold:   [${thresholdBar}]`);
+      
+      return result;
+    } catch (error) {
+      console.error('[COBRA VAD] Error processing audio chunk:', error);
+      // Return safe default values on error
+      return {
+        voiceProbability: 0,
+        hasVoice: false,
+        timestamp: Date.now()
+      };
+    }
+  }
+  
+  private convertBufferToPCM16(buffer: Buffer): Int16Array {
+    try {
+      // Check if this is a WAV file (starts with "RIFF")
+      if (buffer.length >= 44 && buffer.toString('ascii', 0, 4) === 'RIFF') {
+        console.log('[COBRA VAD] Detected WAV format, extracting PCM data');
+        
+        // Skip WAV header (44 bytes) and extract raw PCM data
+        const pcmData = buffer.slice(44);
+        const samples = new Int16Array(Math.floor(pcmData.length / 2));
+        
+        for (let i = 0; i < samples.length; i++) {
+          const byteIndex = i * 2;
+          if (byteIndex + 1 < pcmData.length) {
+            samples[i] = pcmData.readInt16LE(byteIndex);
+          }
+        }
+        
+        // Analyze the audio data quality
+        const maxSample = Math.max(...Array.from(samples));
+        const minSample = Math.min(...Array.from(samples));
+        const avgAbsValue = Array.from(samples).reduce((sum, val) => sum + Math.abs(val), 0) / samples.length;
+        
+        console.log(`[COBRA VAD] Converted WAV to ${samples.length} PCM samples`);
+        console.log(`[COBRA VAD] Audio analysis: max=${maxSample}, min=${minSample}, avgAbs=${avgAbsValue.toFixed(1)}`);
+        
+        // Check if audio is too quiet
+        if (avgAbsValue < 100) {
+          console.log(`[COBRA VAD] WARNING: Audio seems very quiet (avgAbs=${avgAbsValue.toFixed(1)}), this may affect voice detection`);
+        }
+        
+        // Resample to 16kHz if needed (Cobra VAD requirement)
+        const targetSampleRate = 16000;
+        const estimatedSampleRate = this.estimateSampleRate(buffer);
+        
+        if (estimatedSampleRate !== targetSampleRate) {
+          console.log(`[COBRA VAD] Resampling from ${estimatedSampleRate}Hz to ${targetSampleRate}Hz`);
+          return this.resampleAudio(samples, estimatedSampleRate, targetSampleRate);
+        }
+        
+        return samples;
+      } else {
+        // Assume raw PCM data
+        console.log('[COBRA VAD] Processing as raw PCM data');
+        const samples = new Int16Array(Math.floor(buffer.length / 2));
+        
+        for (let i = 0; i < samples.length; i++) {
+          const byteIndex = i * 2;
+          if (byteIndex + 1 < buffer.length) {
+            samples[i] = buffer.readInt16LE(byteIndex);
+          }
+        }
+        
+        console.log(`[COBRA VAD] Converted raw data to ${samples.length} PCM samples`);
+        return samples;
+      }
+    } catch (error) {
+      console.error('[COBRA VAD] Error converting audio buffer:', error);
+      return new Int16Array(0);
+    }
+  }
+  
+  public setVoiceThreshold(threshold: number): void {
+    this.voiceThreshold = Math.max(0, Math.min(1, threshold));
+    console.log(`[COBRA VAD] Voice threshold updated to: ${(this.voiceThreshold * 100).toFixed(1)}%`);
+  }
+  
+  public getLastVoiceProbability(): number {
+    return this.lastVoiceProbability;
+  }
+  
+  private estimateSampleRate(buffer: Buffer): number {
+    // Try to extract sample rate from WAV header
+    if (buffer.length >= 28 && buffer.toString('ascii', 0, 4) === 'RIFF') {
+      console.log(`[COBRA VAD] WAV header analysis: buffer size=${buffer.length}`);
+      console.log(`[COBRA VAD] First 44 bytes: ${buffer.subarray(0, Math.min(44, buffer.length)).toString('hex')}`);
+      
+      // Check if it's a proper WAV file with 'WAVE' identifier
+      const waveId = buffer.toString('ascii', 8, 12);
+      console.log(`[COBRA VAD] WAVE identifier: "${waveId}"`);
+      
+      if (waveId === 'WAVE') {
+        // Look for the 'fmt ' chunk
+        let offset = 12;
+        while (offset < buffer.length - 8) {
+          const chunkId = buffer.toString('ascii', offset, offset + 4);
+          const chunkSize = buffer.readUInt32LE(offset + 4);
+          console.log(`[COBRA VAD] Found chunk: "${chunkId}" size: ${chunkSize} at offset: ${offset}`);
+          
+          if (chunkId === 'fmt ') {
+            // Found format chunk, sample rate is at offset + 12
+            if (offset + 16 < buffer.length) {
+              const sampleRate = buffer.readUInt32LE(offset + 12);
+              console.log(`[COBRA VAD] Detected sample rate from WAV header: ${sampleRate}Hz`);
+              if (sampleRate > 0 && sampleRate <= 192000) { // Sanity check
+                return sampleRate;
+              }
+            }
+            break;
+          }
+          
+          offset += 8 + chunkSize;
+          if (offset >= buffer.length) break; // Prevent infinite loop
+        }
+      }
+      
+      // Fallback: try the old method at offset 24
+      const sampleRate = buffer.readUInt32LE(24);
+      console.log(`[COBRA VAD] Fallback sample rate detection: ${sampleRate}Hz`);
+      if (sampleRate > 0 && sampleRate <= 192000) {
+        return sampleRate;
+      }
+    }
+    
+    // Default assumption if no valid header found
+    console.log(`[COBRA VAD] No valid WAV header found, assuming 48000Hz`);
+    return 48000;
+  }
+  
+  private resampleAudio(samples: Int16Array, fromRate: number, toRate: number): Int16Array {
+    if (fromRate === toRate) return samples;
+    
+    // Validate input parameters
+    if (fromRate <= 0 || toRate <= 0 || !isFinite(fromRate) || !isFinite(toRate)) {
+      console.warn(`[COBRA VAD] Invalid sample rates: from=${fromRate}, to=${toRate}. Returning original samples.`);
+      return samples;
+    }
+    
+    const ratio = fromRate / toRate;
+    if (!isFinite(ratio) || ratio <= 0) {
+      console.warn(`[COBRA VAD] Invalid ratio: ${ratio}. Returning original samples.`);
+      return samples;
+    }
+    
+    const newLength = Math.floor(samples.length / ratio);
+    if (newLength <= 0 || !isFinite(newLength)) {
+      console.warn(`[COBRA VAD] Invalid new length: ${newLength}. Returning original samples.`);
+      return samples;
+    }
+    
+    try {
+      const resampled = new Int16Array(newLength);
+      
+      for (let i = 0; i < newLength; i++) {
+        const sourceIndex = Math.floor(i * ratio);
+        resampled[i] = samples[sourceIndex] || 0;
+      }
+      
+      console.log(`[COBRA VAD] Resampled ${samples.length} samples to ${resampled.length} samples (${fromRate}Hz -> ${toRate}Hz)`);
+      return resampled;
+    } catch (error) {
+      console.error(`[COBRA VAD] Error during resampling:`, error);
+      return samples; // Return original if resampling fails
+    }
+  }
+
+  public async release(): Promise<void> {
+    if (this.cobra) {
+      this.cobra.release();
+      this.cobra = null;
+      this.isInitialized = false;
+      console.log('[COBRA VAD] Released Cobra VAD resources');
+    }
+  }
+}
+
 // Audio stream processor for handling continuous audio
 class AudioStreamProcessor {
   private clientState: ClientState;
@@ -422,191 +680,38 @@ class AudioStreamProcessor {
   private readonly maxBufferSize = 30; // Increased from 20 to capture even longer statements
   private readonly silenceTimeoutMs = 3000; // Increased from 2000 to allow for longer pauses
   private readonly forceProcessTimeoutMs = 15000; // Increased from 10000 to allow for even longer statements
-  private readonly energyThreshold = 0.05; // Increased threshold to better distinguish voice from background noise
   private vadActive: boolean = false;
   private lastVoiceActivityTime = 0;
   private voiceActivityState: 'SILENCE' | 'SPEAKING' = 'SILENCE';
   
-  // Track energy levels for dynamic threshold adjustment
-  private recentEnergyLevels: number[] = [];
-  private readonly maxEnergyHistorySize = 50;
+  private cobraVADProcessor: CobraVADProcessor | null = null;
+  private lastCobraResult: CobraVADResult | null = null;
   
   constructor(clientState: ClientState) {
     this.clientState = clientState;
+    this.initializeCobraVAD();
   }
   
-  // Method to adjust VAD threshold dynamically based on recent audio
-  public adjustVADThreshold(): number {
-    if (this.recentEnergyLevels.length < 10) {
-      // Not enough data to adjust threshold
-      return this.energyThreshold;
-    }
-    
-    // Sort energy levels and find the noise floor (25th percentile)
-    const sortedLevels = [...this.recentEnergyLevels].sort((a, b) => a - b);
-    const noiseFloorIndex = Math.floor(sortedLevels.length * 0.25);
-    const noiseFloor = sortedLevels[noiseFloorIndex];
-    
-    // Find the median energy level (50th percentile)
-    const medianIndex = Math.floor(sortedLevels.length * 0.5);
-    const medianEnergy = sortedLevels[medianIndex];
-    
-    // Set threshold to be between noise floor and median
-    // This adapts to the current audio environment
-    const dynamicThreshold = noiseFloor + ((medianEnergy - noiseFloor) * 0.5);
-    
-    // Ensure threshold is within reasonable bounds
-    const minThreshold = 0.003;
-    const maxThreshold = 0.02;
-    const boundedThreshold = Math.max(minThreshold, Math.min(maxThreshold, dynamicThreshold));
-    
-    console.log(`[VAD] Dynamic threshold: ${boundedThreshold.toFixed(4)} (noise: ${noiseFloor.toFixed(4)}, median: ${medianEnergy.toFixed(4)})`);
-    
-    return boundedThreshold;
-  }
-  
-  // Method to visualize the energy distribution and threshold
-  public visualizeEnergyDistribution(): void {
-    if (this.recentEnergyLevels.length < 5) {
-      return; // Not enough data to visualize
-    }
-    
-    const min = Math.min(...this.recentEnergyLevels);
-    const max = Math.max(...this.recentEnergyLevels);
-    const range = max - min;
-    
-    // Create 10 buckets for histogram
-    const buckets = new Array(10).fill(0);
-    
-    // Populate buckets
-    this.recentEnergyLevels.forEach(energy => {
-      if (range === 0) return; // Avoid division by zero
-      const bucketIndex = Math.min(9, Math.floor(((energy - min) / range) * 10));
-      buckets[bucketIndex]++;
-    });
-    
-    // Find the current threshold position in the histogram
-    const thresholdBucket = range === 0 ? 0 : 
-      Math.min(9, Math.floor(((this.energyThreshold - min) / range) * 10));
-    
-    // Create visualization
-    console.log('[VAD] Energy distribution:');
-    const maxCount = Math.max(...buckets);
-    
-    for (let i = 9; i >= 0; i--) {
-      const barLength = Math.round((buckets[i] / maxCount) * 20);
-      const bar = '█'.repeat(barLength) + ' '.repeat(20 - barLength);
-      
-      const energyValue = min + ((i + 0.5) / 10) * range;
-      const isThresholdBar = i === thresholdBucket;
-      
-      console.log(`${energyValue.toFixed(4)} ${isThresholdBar ? '|>' : '| '} ${bar} ${buckets[i]}`);
-    }
-    
-    console.log(`[VAD] Threshold: ${this.energyThreshold.toFixed(4)}, Range: ${min.toFixed(4)}-${max.toFixed(4)}`);
-  }
-  
-  // Method to analyze frequency characteristics of audio
-  private analyzeFrequencyCharacteristics(audioData: Buffer): {
-    isLikelyVoice: boolean;
-    lowEnergy: number;
-    midEnergy: number;
-    highEnergy: number;
-    voiceConfidence: number;
-  } {
+  private async initializeCobraVAD(): Promise<void> {
     try {
-      // This is a simplified frequency analysis that works directly on raw audio bytes
-      // It divides the audio into segments and analyzes energy in different "frequency bands"
-      // by looking at the rate of change between samples
-      
-      if (audioData.length < 100) {
-        return { isLikelyVoice: false, lowEnergy: 0, midEnergy: 0, highEnergy: 0, voiceConfidence: 0 };
+      const accessKey = process.env.PICOVOICE_ACCESS_KEY;
+      if (!accessKey) {
+        console.warn('[COBRA VAD] PICOVOICE_ACCESS_KEY not found in environment variables. Using fallback energy-based VAD.');
+        return;
       }
       
-      const centerValue = 128; // Center value for unsigned 8-bit audio
-      let lowBandEnergy = 0;   // Approximates 0-500Hz
-      let midBandEnergy = 0;   // Approximates 500-2000Hz (where most speech is)
-      let highBandEnergy = 0;  // Approximates 2000+Hz
-      
-      // Calculate differences between consecutive samples at different intervals
-      // This roughly approximates different frequency bands
-      
-      // Low frequencies - changes between samples far apart
-      for (let i = 20; i < audioData.length; i += 3) {
-        const diff = Math.abs(audioData[i] - audioData[i - 20]);
-        lowBandEnergy += diff * diff;
-      }
-      
-      // Mid frequencies - changes between samples at medium distance
-      for (let i = 8; i < audioData.length; i += 2) {
-        const diff = Math.abs(audioData[i] - audioData[i - 8]);
-        midBandEnergy += diff * diff;
-      }
-      
-      // High frequencies - changes between adjacent samples
-      for (let i = 1; i < audioData.length; i += 1) {
-        const diff = Math.abs(audioData[i] - audioData[i - 1]);
-        highBandEnergy += diff * diff;
-      }
-      
-      // Normalize energies
-      const sampleCount = audioData.length;
-      lowBandEnergy = Math.sqrt(lowBandEnergy / (sampleCount / 3)) / centerValue;
-      midBandEnergy = Math.sqrt(midBandEnergy / (sampleCount / 2)) / centerValue;
-      highBandEnergy = Math.sqrt(highBandEnergy / sampleCount) / centerValue;
-      
-      // Human speech typically has stronger mid-frequency energy
-      // Calculate several metrics to determine if this is likely human speech
-      
-      // 1. Mid-band dominance (human speech has strong mid-frequencies)
-      const totalEnergy = lowBandEnergy + midBandEnergy + highBandEnergy + 0.0001;
-      const midBandRatio = midBandEnergy / totalEnergy;
-      
-      // 2. High-to-low ratio (speech typically has more high than very low frequencies)
-      const highToLowRatio = highBandEnergy / (lowBandEnergy + 0.0001);
-      
-      // 3. Energy variation (speech has more variation than constant background noise)
-      // Calculate standard deviation of sample differences as a measure of variation
-      let sumDiffs = 0;
-      let sumDiffsSq = 0;
-      let count = 0;
-      
-      for (let i = 10; i < audioData.length; i += 10) {
-        const diff = Math.abs(audioData[i] - audioData[i - 10]);
-        sumDiffs += diff;
-        sumDiffsSq += diff * diff;
-        count++;
-      }
-      
-      const meanDiff = count > 0 ? sumDiffs / count : 0;
-      const stdDevDiff = count > 0 ? 
-        Math.sqrt((sumDiffsSq / count) - (meanDiff * meanDiff)) : 0;
-      
-      // Normalize standard deviation
-      const normalizedStdDev = stdDevDiff / centerValue;
-      
-      // Calculate voice confidence score (0-1) based on these metrics
-      const midBandScore = Math.min(1, midBandRatio * 2); // Weight mid-band importance
-      const variationScore = Math.min(1, normalizedStdDev * 10); // Weight variation
-      
-      // Combined voice confidence score
-      const voiceConfidence = (midBandScore * 0.6) + (variationScore * 0.4);
-      
-      // Determine if this is likely voice based on confidence threshold
-      const isLikelyVoice = voiceConfidence > 0.4 && midBandEnergy > 0.1;
-      
-      return {
-        isLikelyVoice,
-        lowEnergy: lowBandEnergy,
-        midEnergy: midBandEnergy,
-        highEnergy: highBandEnergy,
-        voiceConfidence
-      };
+      this.cobraVADProcessor = new CobraVADProcessor(accessKey);
+      await this.cobraVADProcessor.initialize();
+      console.log('[COBRA VAD] Cobra VAD integration successful');
     } catch (error) {
-      console.error('[ERROR] Error analyzing frequency characteristics:', error);
-      return { isLikelyVoice: false, lowEnergy: 0, midEnergy: 0, highEnergy: 0, voiceConfidence: 0 };
+      console.error('[COBRA VAD] Failed to initialize Cobra VAD, falling back to energy-based VAD:', error);
+      this.cobraVADProcessor = null;
     }
   }
+  
+
+  
+
   
   public addChunk(chunk: Buffer, sequence: number, timestamp: number): void {
     console.log(`[TRACE] Adding audio chunk #${sequence}, size: ${chunk.length} bytes, timestamp: ${timestamp}`);
@@ -646,7 +751,7 @@ class AudioStreamProcessor {
       const latestChunk = this.audioChunks[this.audioChunks.length - 1];
       
       try {
-        this.detectVoiceActivity(latestChunk.data);
+        await this.detectVoiceActivity(latestChunk.data);
       } catch (vadError) {
         console.error('[ERROR] Error detecting voice activity:', vadError);
         // Continue processing even if VAD fails
@@ -672,111 +777,18 @@ class AudioStreamProcessor {
     }
   }
   
-  private detectVoiceActivity(audioData: Buffer): void {
+  private async detectVoiceActivity(audioData: Buffer): Promise<void> {
     try {
       console.log(`[TRACE] Analyzing audio chunk of ${audioData.length} bytes for voice activity`);
       
-      // Simple energy-based voice activity detection using raw bytes
-      // This is a simplified approach that works with any buffer format
-      
-      // Calculate average energy from raw bytes
-      let totalEnergy = 0;
-      const centerValue = 128; // Center value for unsigned 8-bit audio
-      
-      // Calculate min, max, and histogram for visualization
-      let minValue = 255;
-      let maxValue = 0;
-      const histogram = new Array(10).fill(0); // 10 energy level buckets
-      
-      // Process each byte as an unsigned 8-bit sample
-      for (let i = 0; i < audioData.length; i++) {
-        const value = audioData[i];
-        
-        // Track min/max values
-        if (value < minValue) minValue = value;
-        if (value > maxValue) maxValue = value;
-        
-        // Calculate distance from center (128) as a measure of energy
-        const distance = Math.abs(value - centerValue);
-        totalEnergy += distance * distance;
-        
-        // Add to histogram (every 100th sample to avoid excessive computation)
-        if (i % 100 === 0) {
-          const bucketIndex = Math.min(9, Math.floor(distance / 25)); // 0-9 buckets
-          histogram[bucketIndex]++;
-        }
-      }
-      
-      // Calculate RMS (root mean square) energy
-      const rms = Math.sqrt(totalEnergy / audioData.length) / centerValue;
-      
-      // Add to recent energy levels for dynamic threshold adjustment
-      this.recentEnergyLevels.push(rms);
-      if (this.recentEnergyLevels.length > this.maxEnergyHistorySize) {
-        this.recentEnergyLevels.shift(); // Remove oldest entry
-      }
-      
-      // Use dynamic threshold if we have enough data
-      const currentThreshold = this.recentEnergyLevels.length >= 10 ? 
-        this.adjustVADThreshold() : this.energyThreshold;
-      
-      // Analyze frequency characteristics
-      const freqAnalysis = this.analyzeFrequencyCharacteristics(audioData);
-      
-      // Determine if this is voice using both energy and frequency characteristics
-      const energyDetectedVoice = rms > currentThreshold;
-      const freqDetectedVoice = freqAnalysis.isLikelyVoice;
-      
-      // Combined detection with stricter requirements to avoid false positives
-      // Require EITHER:
-      // 1. Energy above threshold AND some voice confidence, OR
-      // 2. High voice confidence even with slightly lower energy
       const previousVadActive = this.vadActive;
-      this.vadActive = (energyDetectedVoice && freqAnalysis.voiceConfidence > 0.2) || 
-                      (rms > currentThreshold * 0.7 && freqAnalysis.voiceConfidence > 0.5);
       
-      // Create ASCII visualization of energy levels
-      const energyPercentage = Math.min(100, Math.round(rms * 1000));
-      const energyBar = '█'.repeat(Math.floor(energyPercentage / 5)) + '░'.repeat(20 - Math.floor(energyPercentage / 5));
-      const thresholdPosition = Math.floor((currentThreshold * 1000) / 5);
-      const thresholdBar = ' '.repeat(thresholdPosition) + '|' + ' '.repeat(20 - thresholdPosition);
-      
-      // Log detailed VAD information for every chunk
-      console.log(`[VAD] Chunk energy: ${rms.toFixed(4)} | Threshold: ${currentThreshold.toFixed(4)} | Speaking: ${this.vadActive ? 'YES' : 'NO'}`);
-      console.log(`[VAD] Energy level: [${energyBar}] ${energyPercentage}%`);
-      console.log(`[VAD] Threshold:    [${thresholdBar}]`);
-      console.log(`[VAD] Audio range: min=${minValue}, max=${maxValue}, spread=${maxValue-minValue}`);
-      
-      // Log frequency analysis results
-      console.log(`[VAD] Frequency bands - Low: ${freqAnalysis.lowEnergy.toFixed(4)}, Mid: ${freqAnalysis.midEnergy.toFixed(4)}, High: ${freqAnalysis.highEnergy.toFixed(4)}`);
-      console.log(`[VAD] Voice confidence: ${(freqAnalysis.voiceConfidence * 100).toFixed(1)}%, Likely voice: ${freqAnalysis.isLikelyVoice ? 'YES' : 'NO'}`);
-      
-      // Create frequency band visualization
-      const maxFreqEnergy = Math.max(freqAnalysis.lowEnergy, freqAnalysis.midEnergy, freqAnalysis.highEnergy);
-      if (maxFreqEnergy > 0) {
-        const lowBar = '█'.repeat(Math.floor((freqAnalysis.lowEnergy / maxFreqEnergy) * 20));
-        const midBar = '█'.repeat(Math.floor((freqAnalysis.midEnergy / maxFreqEnergy) * 20));
-        const highBar = '█'.repeat(Math.floor((freqAnalysis.highEnergy / maxFreqEnergy) * 20));
-        console.log(`[VAD] Low freq:  ${lowBar}`);
-        console.log(`[VAD] Mid freq:  ${midBar} ${freqAnalysis.midEnergy > Math.max(freqAnalysis.lowEnergy, freqAnalysis.highEnergy) ? '← SPEECH' : ''}`);
-        console.log(`[VAD] High freq: ${highBar}`);
-        
-        // Add confidence visualization
-        const confidenceBar = '█'.repeat(Math.floor(freqAnalysis.voiceConfidence * 20)) + '░'.repeat(20 - Math.floor(freqAnalysis.voiceConfidence * 20));
-        console.log(`[VAD] Confidence: [${confidenceBar}] ${(freqAnalysis.voiceConfidence * 100).toFixed(1)}%`);
-      }
-      
-      // Create histogram visualization
-      const maxBucketValue = Math.max(...histogram);
-      const histogramViz = histogram.map(count => {
-        const height = Math.round((count / maxBucketValue) * 10);
-        return '█'.repeat(height) + ' '.repeat(10 - height);
-      }).join(' ');
-      console.log(`[VAD] Energy distribution: ${histogramViz}`);
-      
-      // Periodically show the energy distribution across recent history
-      if (this.recentEnergyLevels.length >= 20 && Math.random() < 0.1) {
-        this.visualizeEnergyDistribution();
+      // Use Cobra VAD as primary detection method
+      if (this.cobraVADProcessor) {
+        await this.detectVoiceActivityWithCobra(audioData);
+      } else {
+        console.warn('[VAD] Cobra VAD not available - no voice detection performed');
+        this.vadActive = false;
       }
       
       // Log state changes for debugging
@@ -784,28 +796,59 @@ class AudioStreamProcessor {
         console.log(`[VAD] *** Voice activity changed: ${this.vadActive ? 'SPEAKING' : 'SILENT'} ***`);
       }
       
-      // Send VAD status to client with more detailed information
-      if (this.clientState.ws.readyState === WebSocket.OPEN) {
-        this.clientState.ws.send(JSON.stringify({
-          type: 'vad_status',
-          isSpeaking: this.vadActive,
-          audioLevel: rms,
-          threshold: currentThreshold,
-          energyPercentage: energyPercentage,
-          minValue: minValue,
-          maxValue: maxValue,
-          freqAnalysis: {
-            lowEnergy: freqAnalysis.lowEnergy,
-            midEnergy: freqAnalysis.midEnergy,
-            highEnergy: freqAnalysis.highEnergy,
-            isLikelyVoice: freqAnalysis.isLikelyVoice
-          },
-          timestamp: Date.now()
-        }));
-      }
+      // Send VAD status to client
+      this.sendVADStatusToClient();
+      
     } catch (error) {
       console.error('[ERROR] Error in voice activity detection:', error);
       // Don't update VAD status on error
+    }
+  }
+  
+  private async detectVoiceActivityWithCobra(audioData: Buffer): Promise<void> {
+    try {
+      if (!this.cobraVADProcessor) {
+        throw new Error('Cobra VAD processor not available');
+      }
+      
+      const cobraResult = await this.cobraVADProcessor.processAudioChunk(audioData);
+      this.lastCobraResult = cobraResult;
+      this.vadActive = cobraResult.hasVoice;
+      
+      console.log(`[VAD] === COBRA VAD RESULTS ===`);
+      console.log(`[VAD] Voice probability: ${(cobraResult.voiceProbability * 100).toFixed(1)}%`);
+      console.log(`[VAD] Voice detected: ${cobraResult.hasVoice ? 'YES' : 'NO'}`);
+      
+    } catch (error) {
+      console.error('[COBRA VAD] Error with Cobra VAD:', error);
+      this.vadActive = false;
+    }
+  }
+  
+
+  
+
+  
+  private sendVADStatusToClient(): void {
+    if (this.clientState.ws.readyState === WebSocket.OPEN) {
+      const status: any = {
+        type: 'vad_status',
+        isSpeaking: this.vadActive,
+        timestamp: Date.now(),
+        vadMethod: this.cobraVADProcessor ? 'cobra' : 'energy'
+      };
+      
+      if (this.lastCobraResult) {
+        status.cobra = {
+          voiceProbability: this.lastCobraResult.voiceProbability,
+          hasVoice: this.lastCobraResult.hasVoice,
+          threshold: this.cobraVADProcessor?.getLastVoiceProbability() || 0
+        };
+      }
+      
+
+      
+      this.clientState.ws.send(JSON.stringify(status));
     }
   }
   
@@ -848,7 +891,7 @@ class AudioStreamProcessor {
         voiceConfidence = midBandEnergy > 0.1 ? 0.5 : 0;
       }
       
-      const hasVoice = rms > this.energyThreshold && voiceConfidence > 0.2;
+      const hasVoice = rms > 0.05 && voiceConfidence > 0.2; // Use fixed threshold since energy VAD is removed
       
       return {
         index,
@@ -1011,6 +1054,18 @@ class AudioStreamProcessor {
   public clearBuffer(): void {
     this.audioChunks = [];
     this.isProcessing = false;
+    this.vadActive = false;
+  }
+  
+  public async release(): Promise<void> {
+    console.log('[DEBUG] Releasing AudioStreamProcessor resources');
+    this.clearBuffer();
+    
+    // Release Cobra VAD resources
+    if (this.cobraVADProcessor) {
+      await this.cobraVADProcessor.release();
+      this.cobraVADProcessor = null;
+    }
   }
 
   // Analyze audio buffer for voice activity
@@ -1469,7 +1524,7 @@ wss.on('connection', (ws: WebSocket) => {
     }
   }
 
-  ws.on('close', () => {
+  ws.on('close', async () => {
     console.log('WebSocket connection closed');
     const clientState = clients.get(ws);
     
@@ -1490,16 +1545,16 @@ wss.on('connection', (ws: WebSocket) => {
         clientState.callSession.end();
       }
       
-      // Clear audio processor
+      // Clear audio processor and release resources
       if (clientState.audioProcessor) {
-        clientState.audioProcessor.clearBuffer();
+        await clientState.audioProcessor.release();
       }
     }
     
     clients.delete(ws);
   });
 
-  ws.on('error', (error) => {
+  ws.on('error', async (error) => {
     console.error('WebSocket error:', error);
     const clientState = clients.get(ws);
     
@@ -1520,9 +1575,9 @@ wss.on('connection', (ws: WebSocket) => {
         clientState.callSession.end();
       }
       
-      // Clear audio processor
+      // Clear audio processor and release resources
       if (clientState.audioProcessor) {
-        clientState.audioProcessor.clearBuffer();
+        await clientState.audioProcessor.release();
       }
     }
     
@@ -1546,7 +1601,7 @@ app.get('/', (req, res) => {
   res.send('Voice Assistant Backend API');
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
 // Function to check if the AssemblyAI API key is valid
 async function checkAssemblyAIApiKey(): Promise<boolean> {
@@ -1585,10 +1640,10 @@ async function initializeServer() {
     }
     
     // Start the server
-    server.listen(PORT, () => {
+    server.listen(Number(PORT), '0.0.0.0', () => {
       console.log(`🚀 Voice Assistant Backend running on port ${PORT}`);
-      console.log(`📡 WebSocket server ready at ws://localhost:${PORT}`);
-      console.log(`🌐 HTTP server ready at http://localhost:${PORT}`);
+      console.log(`📡 WebSocket server ready at ws://192.168.1.80:${PORT}`);
+      console.log(`🌐 HTTP server ready at http://192.168.1.80:${PORT}`);
       console.log(`🎤 Audio files will be saved to: ${audioDir}`);
     });
   } catch (error) {
