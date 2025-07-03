@@ -36,6 +36,7 @@ export class AIAssistant {
   private isProcessingAIResponse: boolean = false; // Prevent concurrent AI response generation
   private shouldResumeTranscriptionAfterAudio: boolean = false; // Flag to resume transcription after audio
   private onTranscriptCallback: ((text: string, isFinal: boolean) => void) | null = null;
+  private onAudioStateCallback: ((isPlaying: boolean) => void) | null = null;
 
   // Equivalent to self.transcriber = None
   private transcriber: any = null;
@@ -48,8 +49,12 @@ export class AIAssistant {
     }
   ];
 
-  constructor(onTranscript?: (text: string, isFinal: boolean) => void) {
+  constructor(
+    onTranscript?: (text: string, isFinal: boolean) => void,
+    onAudioState?: (isPlaying: boolean) => void
+  ) {
     this.onTranscriptCallback = onTranscript || null;
+    this.onAudioStateCallback = onAudioState || null;
   }
   
   private async requestMicrophonePermission(): Promise<boolean> {
@@ -175,6 +180,7 @@ export class AIAssistant {
 
       this.transcriptionSocket.onerror = (error) => {
         console.error('❌ AssemblyAI WebSocket error:', error);
+        this.isTranscribing = false;
         this.onError(error);
       };
 
@@ -185,7 +191,15 @@ export class AIAssistant {
         // Handle specific error codes
         if (event.code === 4102) {
           console.log('⚠️ Stream limit exceeded - waiting before allowing retry...');
-          // You could add a delay here before allowing new connections
+        } else if (event.code === 1006) {
+          console.log('⚠️ WebSocket connection lost unexpectedly');
+        } else if (event.code !== 1000) {
+          console.log(`⚠️ WebSocket closed with unusual code: ${event.code}`);
+        }
+        
+        // Ensure proper cleanup even on unexpected closure
+        if (this.transcriptionSocket) {
+          this.transcriptionSocket = null;
         }
         
         this.onClose();
@@ -299,9 +313,12 @@ export class AIAssistant {
       // Clean up AudioRecord if initialized
       if (this.audioRecordInitialized && AudioRecord) {
         try {
-          // Remove data event listener specifically
+          // Remove all event listeners to prevent memory leaks
           if (AudioRecord.off) {
             AudioRecord.off('data');
+          }
+          if (AudioRecord.removeAllListeners) {
+            AudioRecord.removeAllListeners();
           }
           this.audioRecordInitialized = false;
           console.log('AudioRecord cleaned up');
@@ -325,11 +342,28 @@ export class AIAssistant {
         }
       }
 
-      // Close WebSocket connection
+      // Close WebSocket connection with proper cleanup
       if (this.transcriptionSocket) {
-        this.transcriptionSocket.close();
-        this.transcriptionSocket = null;
-        console.log('WebSocket connection closed properly');
+        try {
+          // Remove event listeners to prevent memory leaks
+          this.transcriptionSocket.onopen = null;
+          this.transcriptionSocket.onmessage = null;
+          this.transcriptionSocket.onerror = null;
+          this.transcriptionSocket.onclose = null;
+          
+          // Close the connection
+          if (this.transcriptionSocket.readyState === WebSocket.OPEN || 
+              this.transcriptionSocket.readyState === WebSocket.CONNECTING) {
+            this.transcriptionSocket.close(1000, 'Normal closure');
+          }
+          
+          this.transcriptionSocket = null;
+          console.log('WebSocket connection closed properly with cleanup');
+        } catch (error) {
+          console.error('Error closing WebSocket:', error);
+          // Force cleanup even if close fails
+          this.transcriptionSocket = null;
+        }
       }
 
       console.log('Transcription stopped completely');
@@ -380,6 +414,26 @@ export class AIAssistant {
     return this.isTranscribing;
   }
 
+  // Method to interrupt AI and start listening immediately
+  async interruptAndListen(): Promise<boolean> {
+    console.log('🚫 User interrupted AI - stopping audio and starting transcription...');
+    
+    // Stop any currently playing audio
+    this.stopCurrentAudio();
+    this.shouldCancelAudioGeneration = true;
+    
+    // Clear the resume flag since we're manually restarting
+    this.shouldResumeTranscriptionAfterAudio = false;
+    
+    // Start transcription immediately
+    const success = await this.startTranscription();
+    if (success) {
+      console.log('🎤 Transcription restarted after interruption');
+    }
+    
+    return success;
+  }
+
   // Step 3: Pass real-time transcript to Groq AI
   async generateAIResponse(transcriptText: string): Promise<void> {
     try {
@@ -398,6 +452,7 @@ export class AIAssistant {
       try {
         // Generate response using Groq API directly with fetch
         console.log(`Calling Groq API with model: ${CONFIG.DEFAULT_MODEL}`);
+        console.log(`Groq API Key (first 10 chars): ${this.groqApiKey.substring(0, 10)}...`);
         
         const requestBody = {
           model: CONFIG.DEFAULT_MODEL,
@@ -405,6 +460,8 @@ export class AIAssistant {
           temperature: CONFIG.TEMPERATURE,
           max_tokens: CONFIG.MAX_TOKENS
         };
+        
+        console.log('Request body:', JSON.stringify(requestBody, null, 2));
         
         const response = await fetch(CONFIG.GROQ_API_ENDPOINT, {
           method: 'POST',
@@ -415,11 +472,25 @@ export class AIAssistant {
           body: JSON.stringify(requestBody)
         });
         
-        const responseData = await response.json();
-        console.log('Groq API response received:', JSON.stringify(responseData));
+        console.log(`Response status: ${response.status} ${response.statusText}`);
+        
+        const responseText = await response.text();
+        console.log('Groq API raw response:', responseText);
+        
+        let responseData;
+        try {
+          responseData = JSON.parse(responseText);
+          console.log('Groq API response received:', JSON.stringify(responseData));
+        } catch (parseError) {
+          console.error('Failed to parse Groq API response as JSON:', parseError);
+          console.error('Raw response text:', responseText);
+          throw new Error(`Invalid JSON response from Groq API: ${responseText.substring(0, 200)}...`);
+        }
         
         if (!response.ok) {
-          throw new Error(`Groq API error: ${response.status} - ${JSON.stringify(responseData)}`);
+          console.error(`Groq API HTTP error: ${response.status} ${response.statusText}`);
+          console.error('Response headers:', JSON.stringify([...response.headers.entries()]));
+          throw new Error(`Groq API error: ${response.status} ${response.statusText} - ${responseText.substring(0, 200)}...`);
         }
 
         const aiResponse = responseData.choices[0].message.content;
@@ -604,6 +675,11 @@ export class AIAssistant {
         // Track current sound for potential interruption
         this.currentSound = sound;
         
+        // Notify UI that AI audio is starting
+        if (this.onAudioStateCallback) {
+          this.onAudioStateCallback(true);
+        }
+        
         // Set volume to maximum for loudspeaker playback
         sound.setVolume(1.0);
         
@@ -617,6 +693,11 @@ export class AIAssistant {
           
           // Clear current sound reference
           this.currentSound = null;
+          
+          // Notify UI that AI audio has stopped
+          if (this.onAudioStateCallback) {
+            this.onAudioStateCallback(false);
+          }
           
           // Release the audio player resource
           sound.release();
@@ -655,6 +736,11 @@ export class AIAssistant {
           console.log('✅ Audio stopped successfully');
           this.currentSound.release();
           this.currentSound = null;
+          
+          // Notify UI that AI audio has stopped
+          if (this.onAudioStateCallback) {
+            this.onAudioStateCallback(false);
+          }
         });
       } catch (error) {
         console.error('Error stopping audio:', error);
@@ -665,6 +751,11 @@ export class AIAssistant {
           console.error('Error releasing audio:', releaseError);
         }
         this.currentSound = null;
+        
+        // Notify UI that AI audio has stopped even on error
+        if (this.onAudioStateCallback) {
+          this.onAudioStateCallback(false);
+        }
       }
     }
   }
@@ -674,5 +765,40 @@ export class AIAssistant {
     RNFS.unlink(filePath)
       .then(() => console.log('Temporary audio file deleted'))
       .catch((err) => console.error('Error deleting temporary file:', err));
+  }
+
+  // Comprehensive cleanup method for app shutdown or component unmount
+  async cleanup(): Promise<void> {
+    console.log('🧹 Starting comprehensive AI Assistant cleanup...');
+    
+    try {
+      // Set manual stop flag to prevent any automatic restarts
+      this.isManuallyStoppedByUser = true;
+      this.shouldCancelAudioGeneration = true;
+      this.shouldResumeTranscriptionAfterAudio = false;
+      
+      // Stop any playing audio immediately
+      this.stopCurrentAudio();
+      
+      // Stop transcription with all cleanup
+      await this.performStopTranscription();
+      
+      // Clear transcript history
+      this.fullTranscript = [
+        {
+          role: "system", 
+          content: CONFIG.SYSTEM_PROMPT
+        }
+      ];
+      
+      // Reset all flags
+      this.isTranscribing = false;
+      this.isRecording = false;
+      this.isProcessingAIResponse = false;
+      
+      console.log('✅ AI Assistant cleanup completed');
+    } catch (error) {
+      console.error('❌ Error during AI Assistant cleanup:', error);
+    }
   }
 }

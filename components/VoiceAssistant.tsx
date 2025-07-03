@@ -15,6 +15,7 @@ const VoiceAssistant = () => {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [assistant, setAssistant] = useState<AIAssistant | null>(null);
+  const [isAISpeaking, setIsAISpeaking] = useState(false);
   
   // Animation values
   const [pulseAnimation] = useState(new Animated.Value(1));
@@ -23,20 +24,32 @@ const VoiceAssistant = () => {
 
   // Initialize the assistant
   useEffect(() => {
-    const aiAssistant = new AIAssistant((text, isFinal) => {
-      if (!isFinal) {
-        setTranscript(text);
-      } else {
-        setTranscript('');
+    const aiAssistant = new AIAssistant(
+      (text, isFinal) => {
+        if (!isFinal) {
+          setTranscript(text);
+        } else {
+          setTranscript('');
+        }
+      },
+      (isPlaying) => {
+        console.log(`🔊 Audio state changed: isPlaying = ${isPlaying}`);
+        setIsAISpeaking(isPlaying);
       }
-    });
+    );
     
     setAssistant(aiAssistant);
 
     return () => {
-      aiAssistant.stopTranscription();
+      console.log('🧹 Component unmounting - cleaning up AI Assistant...');
+      aiAssistant.cleanup();
     };
   }, []);
+
+  // Debug state changes
+  useEffect(() => {
+    console.log(`🔍 State update - isListening: ${isListening}, isAISpeaking: ${isAISpeaking}`);
+  }, [isListening, isAISpeaking]);
 
   // Start pulse animation when listening
   useEffect(() => {
@@ -80,6 +93,8 @@ const VoiceAssistant = () => {
   const toggleListening = async () => {
     if (!assistant) return;
     
+    console.log(`🔍 Button pressed - isListening: ${isListening}, isAISpeaking: ${isAISpeaking}`);
+    
     // Button press animation
     Animated.sequence([
       Animated.timing(buttonScale, {
@@ -94,11 +109,21 @@ const VoiceAssistant = () => {
       }),
     ]).start();
     
-    if (isListening) {
+    if (isAISpeaking) {
+      // Interrupt AI and start listening (highest priority)
+      console.log('🚫 Interrupting AI speech...');
+      const success = await assistant.interruptAndListen();
+      setIsListening(success);
+      if (success) {
+        setTranscript('Listening...');
+      }
+    } else if (isListening) {
+      // Stop the conversation
       await assistant.stopTranscription();
       setIsListening(false);
       setTranscript('');
     } else {
+      // Normal start
       const success = await assistant.startTranscription();
       setIsListening(success);
       if (success) {
@@ -114,6 +139,9 @@ const VoiceAssistant = () => {
     if (isListening) {
       return 'Listening...';
     }
+    if (isAISpeaking) {
+      return 'AI is speaking...';
+    }
     return 'Tap to start conversation';
   };
 
@@ -123,6 +151,9 @@ const VoiceAssistant = () => {
     }
     if (isListening) {
       return '#2196F3'; // Blue for listening
+    }
+    if (isAISpeaking) {
+      return '#FF9800'; // Orange for AI speaking
     }
     return '#757575'; // Gray for idle
   };
@@ -135,12 +166,14 @@ const VoiceAssistant = () => {
       {/* Top status area */}
       <View style={styles.statusContainer}>
         <Text style={styles.appTitle}>Voice Assistant</Text>
-        <View style={styles.statusIndicator}>
-          <View style={[styles.statusDot, { backgroundColor: isListening ? '#4CAF50' : '#757575' }]} />
-          <Text style={[styles.statusText, { color: getStatusColor() }]}>
-            {getStatusText()}
-          </Text>
-        </View>
+                 <View style={styles.statusIndicator}>
+           <View style={[styles.statusDot, { 
+             backgroundColor: isAISpeaking ? '#FF9800' : isListening ? '#4CAF50' : '#757575' 
+           }]} />
+           <Text style={[styles.statusText, { color: getStatusColor() }]}>
+             {getStatusText()}
+           </Text>
+         </View>
       </View>
 
       {/* Central phone button area */}
@@ -190,17 +223,17 @@ const VoiceAssistant = () => {
         )}
 
         {/* Main circular button */}
-        <Animated.View
-          style={[
-            styles.phoneButton,
-            {
-              backgroundColor: isListening ? '#FF5252' : '#4CAF50',
-              transform: [
-                { scale: Animated.multiply(buttonScale, pulseAnimation) },
-              ],
-            },
-          ]}
-        >
+                 <Animated.View
+           style={[
+             styles.phoneButton,
+             {
+               backgroundColor: isAISpeaking ? '#FF9800' : isListening ? '#FF5252' : '#4CAF50',
+               transform: [
+                 { scale: Animated.multiply(buttonScale, pulseAnimation) },
+               ],
+             },
+           ]}
+         >
           <TouchableOpacity
             style={styles.buttonTouchable}
             onPress={toggleListening}
@@ -216,11 +249,21 @@ const VoiceAssistant = () => {
       {/* Bottom instruction area */}
       <View style={styles.instructionContainer}>
         <Text style={styles.instructionText}>
-          {isListening ? 'Tap to end call' : 'Tap to start call'}
+          {isAISpeaking 
+            ? 'Tap to interrupt & speak' 
+            : isListening 
+              ? 'Tap to end call' 
+              : 'Tap to start call'
+          }
         </Text>
         {isListening && (
           <Text style={styles.subInstructionText}>
             Speak naturally - I'm listening
+          </Text>
+        )}
+        {isAISpeaking && (
+          <Text style={styles.subInstructionText}>
+            AI is responding - tap to interrupt
           </Text>
         )}
       </View>
