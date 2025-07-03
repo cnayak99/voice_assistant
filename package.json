@@ -10,9 +10,11 @@
     "test": "jest"
   },
   "dependencies": {
+    "@react-native/new-app-screen": "0.80.1",
     "react": "19.1.0",
     "react-native": "0.80.1",
-    "@react-native/new-app-screen": "0.80.1"
+    "react-native-audio-record": "^0.2.2",
+    "react-native-reanimated": "^3.18.0"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
