@@ -30,6 +30,11 @@ export class AIAssistant {
   private audioRecordInitialized: boolean = false; // AudioRecord initialization state
   
   private isTranscribing: boolean = false;
+  private isManuallyStoppedByUser: boolean = false;
+  private currentSound: any = null; // Track current playing sound for interruption
+  private shouldCancelAudioGeneration: boolean = false; // Flag to cancel ongoing audio generation
+  private isProcessingAIResponse: boolean = false; // Prevent concurrent AI response generation
+  private shouldResumeTranscriptionAfterAudio: boolean = false; // Flag to resume transcription after audio
   private onTranscriptCallback: ((text: string, isFinal: boolean) => void) | null = null;
 
   // Equivalent to self.transcriber = None
@@ -98,6 +103,10 @@ export class AIAssistant {
     try {
       console.log('🎤 Starting real-time transcription...');
       console.log('🔧 AudioRecord available:', !!AudioRecord);
+      
+      // Clear the manual stop flag when user manually starts transcription
+      this.isManuallyStoppedByUser = false;
+      this.shouldCancelAudioGeneration = false;
       
       // Check if we're in cooldown period
       const now = Date.now();
@@ -242,11 +251,40 @@ export class AIAssistant {
     }
   }
 
+  // Stop transcription manually by user (sets manual stop flag)
   async stopTranscription(): Promise<void> {
     try {
       console.log('Stopping transcription...');
+      console.log('🛑 User manually stopped transcription');
       this.isTranscribing = false;
+      this.isManuallyStoppedByUser = true;
+      
+      // Immediately stop any currently playing audio and cancel audio generation
+      this.stopCurrentAudio();
+      this.shouldCancelAudioGeneration = true;
+      
+      await this.performStopTranscription();
+    } catch (error) {
+      console.error('Error stopping transcription:', error);
+    }
+  }
 
+  // Stop transcription for processing (does NOT set manual stop flag)
+  async stopTranscriptionForProcessing(): Promise<void> {
+    try {
+      console.log('🔄 Stopping transcription for AI processing...');
+      this.isTranscribing = false;
+      // Do NOT set isManuallyStoppedByUser = true here!
+      
+      await this.performStopTranscription();
+    } catch (error) {
+      console.error('Error stopping transcription for processing:', error);
+    }
+  }
+
+  // Common transcription stopping logic
+  private async performStopTranscription(): Promise<void> {
+    try {
       // Stop AudioRecord recording first
       if (this.isRecording && AudioRecord) {
         try {
@@ -316,9 +354,13 @@ export class AIAssistant {
         content: transcript.text
       });
       
-      // Generate AI response when we get a final transcript
-      console.log('Calling generateAIResponse with final transcript');
-      this.generateAIResponse(transcript.text);
+      // Generate AI response when we get a final transcript (only if not already processing)
+      if (!this.isProcessingAIResponse) {
+        console.log('Calling generateAIResponse with final transcript');
+        this.generateAIResponse(transcript.text);
+      } else {
+        console.log('⚠️ Skipping AI response - already processing another response');
+      }
     } else if (transcript.message_type === 'SessionTerminated') {
       console.log('✅ AssemblyAI session properly terminated');
     } else {
@@ -341,8 +383,11 @@ export class AIAssistant {
   // Step 3: Pass real-time transcript to Groq AI
   async generateAIResponse(transcriptText: string): Promise<void> {
     try {
-      // Stop transcription while generating response
-      await this.stopTranscription();
+      // Set processing flag to prevent concurrent responses
+      this.isProcessingAIResponse = true;
+      
+      // Stop transcription while generating response (but not by user)
+      await this.stopTranscriptionForProcessing();
 
       console.log(`\nUser: ${transcriptText}`);
       console.log('Preparing to call Groq API...');
@@ -389,6 +434,8 @@ export class AIAssistant {
         console.log(`\nAI Assistant: ${aiResponse}`);
         
         // Generate audio from the response
+        // Set flag to resume transcription after audio (since we just stopped it for processing)
+        this.shouldResumeTranscriptionAfterAudio = true;
         await this.generateAudio(aiResponse);
       } catch (error: any) {
         console.error('Error calling Groq API:', error);
@@ -397,19 +444,33 @@ export class AIAssistant {
         }
       }
       
-      // Restart transcription
-      await this.startTranscription();
-      console.log("\nReal-time transcription: ");
+            // Transcription will be automatically resumed after audio playback completes
+      // This prevents conversation loops where AI responds to its own audio
+      console.log('🎵 Audio generation completed - transcription will resume after playback...');
     } catch (error) {
       console.error('Error generating AI response:', error);
-      // Restart transcription even if there was an error
-      await this.startTranscription();
+      // On error, manually restart transcription since no audio will be played
+      if (!this.isManuallyStoppedByUser) {
+        console.log('🔄 Error case - restarting transcription (no audio to play)...');
+        await this.startTranscription();
+      } else {
+        console.log('❌ Error case - Not restarting - user has manually stopped');
+      }
+    } finally {
+      // Always clear the processing flag when done
+      this.isProcessingAIResponse = false;
     }
   }
   
   // Step 4: Generate audio with ElevenLabs
   async generateAudio(text: string): Promise<void> {
     try {
+      // Check if audio generation should be cancelled (user pressed stop)
+      if (this.shouldCancelAudioGeneration) {
+        console.log('🚫 Audio generation cancelled - user stopped conversation');
+        return;
+      }
+      
       console.log(`\nGenerating audio for: "${text}"`);
       
       // Prepare request for ElevenLabs API
@@ -445,6 +506,12 @@ export class AIAssistant {
       
       console.log('Audio stream received from ElevenLabs');
       
+      // Check again if audio generation should be cancelled
+      if (this.shouldCancelAudioGeneration) {
+        console.log('🚫 Audio processing cancelled - user stopped conversation');
+        return;
+      }
+      
       // For React Native, we need to use a different approach
       // Instead of using FileReader, we'll use direct Base64 encoding
       
@@ -455,24 +522,35 @@ export class AIAssistant {
       const fileReaderInstance = new FileReader();
       fileReaderInstance.readAsDataURL(audioBlob);
       
-      fileReaderInstance.onload = async () => {
-        try {
-          const base64data = fileReaderInstance.result as string;
-          // Remove the data URL prefix (e.g., "data:audio/mpeg;base64,")
-          const base64Audio = base64data.split(',')[1];
-          
-          // Create a temporary file path
-          const tempDir = RNFS.CachesDirectoryPath;
-          const tempFilePath = `${tempDir}/temp_audio_${Date.now()}.mp3`;
-          
-          console.log('Writing audio to file:', tempFilePath);
-          
-          // Write the file
-          await RNFS.writeFile(tempFilePath, base64Audio, 'base64');
-          console.log('Audio file created:', tempFilePath);
-          
-          // Play the audio
-          await this.playAudioFile(tempFilePath);
+              fileReaderInstance.onload = async () => {
+          try {
+            // Final check before playing audio
+            if (this.shouldCancelAudioGeneration) {
+              console.log('🚫 Audio playback cancelled - user stopped conversation');
+              return;
+            }
+            
+            const base64data = fileReaderInstance.result as string;
+            // Remove the data URL prefix (e.g., "data:audio/mpeg;base64,")
+            const base64Audio = base64data.split(',')[1];
+            
+            // Create a temporary file path
+            const tempDir = RNFS.CachesDirectoryPath;
+            const tempFilePath = `${tempDir}/temp_audio_${Date.now()}.mp3`;
+            
+            console.log('Writing audio to file:', tempFilePath);
+            
+            // Write the file
+            await RNFS.writeFile(tempFilePath, base64Audio, 'base64');
+            console.log('Audio file created:', tempFilePath);
+            
+            // Play the audio (only if not cancelled)
+            if (!this.shouldCancelAudioGeneration) {
+              await this.playAudioFile(tempFilePath);
+            } else {
+              console.log('🚫 Audio file created but playback cancelled');
+              this.cleanupAudioFile(tempFilePath);
+            }
           
         } catch (error) {
           console.error('Error processing audio:', error);
@@ -503,16 +581,28 @@ export class AIAssistant {
       const fileStats = await RNFS.stat(filePath);
       console.log('Audio file size:', fileStats.size, 'bytes');
       
+      // Transcription is already paused for AI processing at this point
+      console.log(`🔍 Debug: shouldResumeTranscriptionAfterAudio = ${this.shouldResumeTranscriptionAfterAudio}`);
+      
       // Create Sound instance - using absolute path
       const sound = new Sound(filePath, undefined, (error) => {
         if (error) {
           console.error('Failed to load the sound:', error);
           this.cleanupAudioFile(filePath);
+          // Resume transcription if it was paused and no manual stop
+          if (this.shouldResumeTranscriptionAfterAudio && !this.isManuallyStoppedByUser) {
+            console.log('🔄 Resuming transcription after audio error...');
+            this.shouldResumeTranscriptionAfterAudio = false;
+            this.startTranscription();
+          }
           return;
         }
         
         console.log('✅ Audio loaded successfully');
         console.log(`🎵 Duration: ${sound.getDuration().toFixed(2)} seconds`);
+        
+        // Track current sound for potential interruption
+        this.currentSound = sound;
         
         // Set volume to maximum for loudspeaker playback
         sound.setVolume(1.0);
@@ -525,11 +615,28 @@ export class AIAssistant {
             console.log('❌ Audio playback failed');
           }
           
+          // Clear current sound reference
+          this.currentSound = null;
+          
           // Release the audio player resource
           sound.release();
           
           // Clean up the temporary file
           this.cleanupAudioFile(filePath);
+          
+          // RESUME TRANSCRIPTION AFTER AI AUDIO PLAYBACK COMPLETES
+          console.log(`🔍 Debug: shouldResumeTranscriptionAfterAudio = ${this.shouldResumeTranscriptionAfterAudio}`);
+          console.log(`🔍 Debug: isManuallyStoppedByUser = ${this.isManuallyStoppedByUser}`);
+          if (this.shouldResumeTranscriptionAfterAudio && !this.isManuallyStoppedByUser) {
+            console.log('▶️ Resuming transcription after AI audio playback...');
+            this.shouldResumeTranscriptionAfterAudio = false;
+            // Small delay to ensure audio hardware is ready
+            setTimeout(() => {
+              this.startTranscription();
+            }, 500);
+          } else {
+            console.log('🔍 Debug: Not resuming transcription - conditions not met');
+          }
         });
       });
       
@@ -539,6 +646,29 @@ export class AIAssistant {
     }
   }
   
+  // Helper method to stop currently playing audio
+  private stopCurrentAudio(): void {
+    if (this.currentSound) {
+      console.log('🔇 Stopping current audio playback');
+      try {
+        this.currentSound.stop(() => {
+          console.log('✅ Audio stopped successfully');
+          this.currentSound.release();
+          this.currentSound = null;
+        });
+      } catch (error) {
+        console.error('Error stopping audio:', error);
+        // Force cleanup even if stop fails
+        try {
+          this.currentSound.release();
+        } catch (releaseError) {
+          console.error('Error releasing audio:', releaseError);
+        }
+        this.currentSound = null;
+      }
+    }
+  }
+
   // Helper method to clean up temporary audio files
   private cleanupAudioFile(filePath: string): void {
     RNFS.unlink(filePath)
