@@ -1,59 +1,98 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, Button, StyleSheet, ScrollView } from 'react-native';
+import { 
+  View, 
+  Text, 
+  StyleSheet, 
+  TouchableOpacity, 
+  Animated, 
+  Dimensions 
+} from 'react-native';
 import { AIAssistant } from '../services/AIAssistant';
-import { ThemedView } from './ThemedView';
-import { ThemedText } from './ThemedText';
+
+const { width, height } = Dimensions.get('window');
 
 const VoiceAssistant = () => {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
-  const [conversation, setConversation] = useState<Array<{role: string, text: string}>>([]);
   const [assistant, setAssistant] = useState<AIAssistant | null>(null);
+  
+  // Animation values
+  const [pulseAnimation] = useState(new Animated.Value(1));
+  const [rippleAnimation] = useState(new Animated.Value(0));
+  const [buttonScale] = useState(new Animated.Value(1));
 
   // Initialize the assistant
   useEffect(() => {
     const aiAssistant = new AIAssistant((text, isFinal) => {
-      // Handle transcription updates
       if (!isFinal) {
         setTranscript(text);
       } else {
         setTranscript('');
-        setConversation(prev => [...prev, { role: 'user', text }]);
       }
     });
     
     setAssistant(aiAssistant);
 
-    // Clean up on unmount
     return () => {
       aiAssistant.stopTranscription();
     };
   }, []);
 
-  // Monkey patch the AIAssistant to capture responses
+  // Start pulse animation when listening
   useEffect(() => {
-    if (assistant) {
-      const originalGenerateAIResponse = assistant.generateAIResponse.bind(assistant);
+    if (isListening) {
+      const pulse = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnimation, {
+            toValue: 1.2,
+            duration: 1000,
+            useNativeDriver: true,
+          }),
+          Animated.timing(pulseAnimation, {
+            toValue: 1,
+            duration: 1000,
+            useNativeDriver: true,
+          }),
+        ])
+      );
       
-      // @ts-ignore - Accessing private method
-      assistant.generateAIResponse = async (transcriptText: string) => {
-        await originalGenerateAIResponse(transcriptText);
-        
-        // Extract the last assistant message from fullTranscript
-        // @ts-ignore - Accessing private property
-        const fullTranscript = assistant['fullTranscript'];
-        if (fullTranscript && fullTranscript.length > 0) {
-          const lastMessage = fullTranscript[fullTranscript.length - 1];
-          if (lastMessage.role === 'assistant') {
-            setConversation(prev => [...prev, { role: 'assistant', text: lastMessage.content }]);
-          }
-        }
+      const ripple = Animated.loop(
+        Animated.timing(rippleAnimation, {
+          toValue: 1,
+          duration: 2000,
+          useNativeDriver: true,
+        })
+      );
+      
+      pulse.start();
+      ripple.start();
+      
+      return () => {
+        pulse.stop();
+        ripple.stop();
       };
+    } else {
+      pulseAnimation.setValue(1);
+      rippleAnimation.setValue(0);
     }
-  }, [assistant]);
+  }, [isListening]);
 
   const toggleListening = async () => {
     if (!assistant) return;
+    
+    // Button press animation
+    Animated.sequence([
+      Animated.timing(buttonScale, {
+        toValue: 0.9,
+        duration: 100,
+        useNativeDriver: true,
+      }),
+      Animated.timing(buttonScale, {
+        toValue: 1,
+        duration: 100,
+        useNativeDriver: true,
+      }),
+    ]).start();
     
     if (isListening) {
       await assistant.stopTranscription();
@@ -68,81 +107,234 @@ const VoiceAssistant = () => {
     }
   };
 
+  const getStatusText = () => {
+    if (transcript && transcript !== 'Listening...') {
+      return transcript;
+    }
+    if (isListening) {
+      return 'Listening...';
+    }
+    return 'Tap to start conversation';
+  };
+
+  const getStatusColor = () => {
+    if (transcript && transcript !== 'Listening...') {
+      return '#4CAF50'; // Green for active speech
+    }
+    if (isListening) {
+      return '#2196F3'; // Blue for listening
+    }
+    return '#757575'; // Gray for idle
+  };
+
   return (
-    <ThemedView style={styles.container}>
-      <ThemedText style={styles.title}>Voice Assistant</ThemedText>
+    <View style={styles.container}>
+      {/* Background gradient effect */}
+      <View style={[styles.backgroundGradient, { backgroundColor: isListening ? '#E3F2FD' : '#FAFAFA' }]} />
       
-      <ScrollView style={styles.conversationContainer}>
-        {conversation.map((message, index) => (
-          <View 
-            key={index} 
-            style={[
-              styles.messageContainer, 
-              message.role === 'user' ? styles.userMessage : styles.assistantMessage
-            ]}
-          >
-            <ThemedText style={styles.messageText}>{message.text}</ThemedText>
-          </View>
-        ))}
-      </ScrollView>
-      
-      <View style={styles.transcriptContainer}>
-        <ThemedText style={styles.transcriptText}>
-          {transcript || (isListening ? 'Listening...' : 'Press Start to begin')}
-        </ThemedText>
+      {/* Top status area */}
+      <View style={styles.statusContainer}>
+        <Text style={styles.appTitle}>Voice Assistant</Text>
+        <View style={styles.statusIndicator}>
+          <View style={[styles.statusDot, { backgroundColor: isListening ? '#4CAF50' : '#757575' }]} />
+          <Text style={[styles.statusText, { color: getStatusColor() }]}>
+            {getStatusText()}
+          </Text>
+        </View>
       </View>
-      
-      <Button 
-        title={isListening ? 'Stop' : 'Start'} 
-        onPress={toggleListening} 
-        color={isListening ? '#FF6347' : '#4CAF50'}
-      />
-    </ThemedView>
+
+      {/* Central phone button area */}
+      <View style={styles.buttonContainer}>
+        {/* Ripple effect rings */}
+        {isListening && (
+          <>
+            <Animated.View
+              style={[
+                styles.rippleRing,
+                {
+                  transform: [
+                    {
+                      scale: rippleAnimation.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [1, 2.5],
+                      }),
+                    },
+                  ],
+                  opacity: rippleAnimation.interpolate({
+                    inputRange: [0, 0.5, 1],
+                    outputRange: [0.3, 0.1, 0],
+                  }),
+                },
+              ]}
+            />
+            <Animated.View
+              style={[
+                styles.rippleRing,
+                {
+                  transform: [
+                    {
+                      scale: rippleAnimation.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [1, 2],
+                      }),
+                    },
+                  ],
+                  opacity: rippleAnimation.interpolate({
+                    inputRange: [0, 0.7, 1],
+                    outputRange: [0.4, 0.2, 0],
+                  }),
+                },
+              ]}
+            />
+          </>
+        )}
+
+        {/* Main circular button */}
+        <Animated.View
+          style={[
+            styles.phoneButton,
+            {
+              backgroundColor: isListening ? '#FF5252' : '#4CAF50',
+              transform: [
+                { scale: Animated.multiply(buttonScale, pulseAnimation) },
+              ],
+            },
+          ]}
+        >
+          <TouchableOpacity
+            style={styles.buttonTouchable}
+            onPress={toggleListening}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.phoneIcon}>
+              {isListening ? '📞' : '📞'}
+            </Text>
+          </TouchableOpacity>
+        </Animated.View>
+      </View>
+
+      {/* Bottom instruction area */}
+      <View style={styles.instructionContainer}>
+        <Text style={styles.instructionText}>
+          {isListening ? 'Tap to end call' : 'Tap to start call'}
+        </Text>
+        {isListening && (
+          <Text style={styles.subInstructionText}>
+            Speak naturally - I'm listening
+          </Text>
+        )}
+      </View>
+    </View>
   );
 };
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 16,
+    backgroundColor: '#FFFFFF',
   },
-  title: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginBottom: 16,
+  backgroundGradient: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    opacity: 0.5,
+  },
+  statusContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingTop: 60,
+    paddingHorizontal: 40,
+  },
+  appTitle: {
+    fontSize: 32,
+    fontWeight: '300',
+    color: '#212121',
+    marginBottom: 40,
+    letterSpacing: 1,
+  },
+  statusIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 25,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 12,
+  },
+  statusText: {
+    fontSize: 16,
+    fontWeight: '500',
+    maxWidth: width - 120,
     textAlign: 'center',
   },
-  conversationContainer: {
+  buttonContainer: {
+    flex: 2,
+    justifyContent: 'center',
+    alignItems: 'center',
+    position: 'relative',
+  },
+  rippleRing: {
+    position: 'absolute',
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    borderWidth: 2,
+    borderColor: '#4CAF50',
+  },
+  phoneButton: {
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    elevation: 8,
+  },
+  buttonTouchable: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 60,
+  },
+  phoneIcon: {
+    fontSize: 40,
+    color: '#FFFFFF',
+  },
+  instructionContainer: {
     flex: 1,
-    marginBottom: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 40,
+    paddingBottom: 60,
   },
-  messageContainer: {
-    padding: 12,
-    borderRadius: 8,
+  instructionText: {
+    fontSize: 18,
+    color: '#424242',
+    textAlign: 'center',
+    fontWeight: '500',
     marginBottom: 8,
-    maxWidth: '80%',
   },
-  userMessage: {
-    alignSelf: 'flex-end',
-    backgroundColor: '#DCF8C6',
-  },
-  assistantMessage: {
-    alignSelf: 'flex-start',
-    backgroundColor: '#E5E5EA',
-  },
-  messageText: {
-    fontSize: 16,
-  },
-  transcriptContainer: {
-    padding: 12,
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 8,
-    marginBottom: 16,
-    minHeight: 60,
-  },
-  transcriptText: {
-    fontSize: 16,
+  subInstructionText: {
+    fontSize: 14,
+    color: '#757575',
+    textAlign: 'center',
     fontStyle: 'italic',
   },
 });

@@ -633,7 +633,7 @@ export class AIAssistant {
             // Small delay to ensure audio hardware is ready
             setTimeout(() => {
               this.startTranscription();
-            }, 500);
+            }, 100);
           } else {
             console.log('🔍 Debug: Not resuming transcription - conditions not met');
           }
