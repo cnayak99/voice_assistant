@@ -1,4 +1,5 @@
 import { PermissionsAndroid, Platform } from 'react-native';
+import { CONFIG } from '../config';
 
 // Mobile audio recorder - Better for live streaming
 let AudioRecord: any = null;
@@ -10,9 +11,8 @@ try {
 
 // AI Assistant class for real-time transcription
 export class AIAssistant {
-  private assemblyAIApiKey: string = "3223b8ecca60452b91e1976aa35e10b5"; // Get free key from https://www.assemblyai.com/dashboard/signup
-  private openaiApiKey: string = "YOUR_OPENAI_API_KEY";
-  private elevenlabsApiKey: string = "YOUR_ELEVENLABS_API_KEY";
+  private assemblyAIApiKey: string = CONFIG.ASSEMBLYAI_API_KEY;
+  private groqApiKey: string = CONFIG.GROQ_API_KEY;
   
   private transcriptionSocket: WebSocket | null = null;
   private lastConnectionAttempt: number = 0;
@@ -32,7 +32,7 @@ export class AIAssistant {
   private fullTranscript: Array<{role: string, content: string}> = [
     {
       role: "system", 
-      content: "You are a receptionist at a dental clinic. Be resourceful and efficient."
+      content: CONFIG.SYSTEM_PROMPT
     }
   ];
 
@@ -236,8 +236,6 @@ export class AIAssistant {
     }
   }
 
-
-
   async stopTranscription(): Promise<void> {
     try {
       console.log('Stopping transcription...');
@@ -304,11 +302,17 @@ export class AIAssistant {
     if (transcript.message_type === 'PartialTranscript') {
       this.onTranscriptCallback?.(transcript.text, false);
     } else if (transcript.message_type === 'FinalTranscript') {
+      console.log(`Final transcript received: "${transcript.text}"`);
       this.onTranscriptCallback?.(transcript.text, true);
+      
       this.fullTranscript.push({
         role: "user",
         content: transcript.text
       });
+      
+      // Generate AI response when we get a final transcript
+      console.log('Calling generateAIResponse with final transcript');
+      this.generateAIResponse(transcript.text);
     } else if (transcript.message_type === 'SessionTerminated') {
       console.log('✅ AssemblyAI session properly terminated');
     } else {
@@ -326,5 +330,71 @@ export class AIAssistant {
 
   getIsTranscribing(): boolean {
     return this.isTranscribing;
+  }
+
+  // Step 3: Pass real-time transcript to Groq AI
+  async generateAIResponse(transcriptText: string): Promise<void> {
+    try {
+      // Stop transcription while generating response
+      await this.stopTranscription();
+
+      console.log(`\nUser: ${transcriptText}`);
+      console.log('Preparing to call Groq API...');
+
+      // Log the messages being sent to Groq
+      console.log('Sending to Groq:', JSON.stringify(this.fullTranscript));
+      
+      try {
+        // Generate response using Groq API directly with fetch
+        console.log(`Calling Groq API with model: ${CONFIG.DEFAULT_MODEL}`);
+        
+        const requestBody = {
+          model: CONFIG.DEFAULT_MODEL,
+          messages: this.fullTranscript,
+          temperature: CONFIG.TEMPERATURE,
+          max_tokens: CONFIG.MAX_TOKENS
+        };
+        
+        const response = await fetch(CONFIG.GROQ_API_ENDPOINT, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${this.groqApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody)
+        });
+        
+        const responseData = await response.json();
+        console.log('Groq API response received:', JSON.stringify(responseData));
+        
+        if (!response.ok) {
+          throw new Error(`Groq API error: ${response.status} - ${JSON.stringify(responseData)}`);
+        }
+
+        const aiResponse = responseData.choices[0].message.content;
+        
+        // Add assistant response to transcript history
+        this.fullTranscript.push({
+          role: "assistant",
+          content: aiResponse
+        });
+
+        // Log the AI response
+        console.log(`\nAI Assistant: ${aiResponse}`);
+      } catch (error: any) {
+        console.error('Error calling Groq API:', error);
+        if (error.response && error.response.data) {
+          console.error('Groq API error details:', error.response.data);
+        }
+      }
+      
+      // Restart transcription
+      await this.startTranscription();
+      console.log("\nReal-time transcription: ");
+    } catch (error) {
+      console.error('Error generating AI response:', error);
+      // Restart transcription even if there was an error
+      await this.startTranscription();
+    }
   }
 }
