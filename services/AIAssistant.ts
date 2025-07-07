@@ -35,6 +35,7 @@ export class AIAssistant {
   private shouldCancelAudioGeneration: boolean = false; // Flag to cancel ongoing audio generation
   private isProcessingAIResponse: boolean = false; // Prevent concurrent AI response generation
   private shouldResumeTranscriptionAfterAudio: boolean = false; // Flag to resume transcription after audio
+  private loggedFirstAudioChunk: boolean = false;
   private onTranscriptCallback: ((text: string, isFinal: boolean) => void) | null = null;
   private onAudioStateCallback: ((isPlaying: boolean) => void) | null = null;
 
@@ -48,6 +49,11 @@ export class AIAssistant {
       content: CONFIG.SYSTEM_PROMPT
     }
   ];
+
+  // Audio buffering for AssemblyAI v3 requirements
+  private audioBuffer: Uint8Array[] = [];
+  private audioBufferSize: number = 0;
+  private readonly targetChunkSize: number = 3200; // ~100ms at 16kHz, 16-bit, mono
 
   constructor(
     onTranscript?: (text: string, isFinal: boolean) => void,
@@ -82,16 +88,23 @@ export class AIAssistant {
   private async getRealtimeToken(): Promise<string> {
     console.log('🔑 Fetching real-time token from AssemblyAI...');
     
-    const res = await fetch('https://api.assemblyai.com/v2/realtime/token', {
-      method: 'POST',
-      headers: {
-        'authorization': this.assemblyAIApiKey,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
-        expires_in: 3600 // Token expires in 1 hour (3600 seconds)
-      })
-    });
+    // AssemblyAI has migrated the real-time STT product to "Streaming" (v3).
+    // Tokens are now obtained with a simple GET request to the new endpoint.
+    // v3 token endpoint requires an expires_in_seconds query param (60–360000).
+    const tokenQuery = new URLSearchParams({
+      expires_in_seconds: '600',          // token TTL (60-360000 sec)
+      max_session_duration_seconds: '600'
+    }).toString();
+
+    const res = await fetch(
+      `https://streaming.assemblyai.com/v3/token?${tokenQuery}`,
+      {
+        method: 'GET',
+        headers: {
+          'authorization': this.assemblyAIApiKey
+        }
+      }
+    );
 
     if (!res.ok) {
       const errorText = await res.text();
@@ -129,7 +142,7 @@ export class AIAssistant {
         if (this.transcriptionSocket.readyState === WebSocket.OPEN) {
           try {
             this.transcriptionSocket.send(JSON.stringify({
-              terminate_session: true
+              type: 'Terminate'
             }));
             await new Promise(resolve => setTimeout(resolve, 500));
           } catch (error) {
@@ -154,7 +167,8 @@ export class AIAssistant {
       // Create WebSocket connection to AssemblyAI
       try {
         const token = await this.getRealtimeToken();
-        const websocketUrl = `wss://api.assemblyai.com/v2/realtime/ws?sample_rate=16000&token=${token}`;
+        // Updated WebSocket host for Streaming STT (v3)
+        const websocketUrl = `wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&format_turns=true&token=${token}`;
         console.log('🌐 Connecting to AssemblyAI WebSocket...');
 
         this.transcriptionSocket = new WebSocket(websocketUrl);
@@ -171,7 +185,7 @@ export class AIAssistant {
       this.transcriptionSocket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          console.log('📨 WebSocket message:', data.message_type);
+          console.log('📨 WebSocket message:', data.type);
           this.onData(data);
         } catch (error) {
           console.error('❌ Error parsing WebSocket message:', error);
@@ -237,18 +251,28 @@ export class AIAssistant {
       AudioRecord.init(options);
       this.audioRecordInitialized = true;
 
-      // Set up real-time data callback
+      // Set up real-time data callback with buffering
       AudioRecord.on('data', (data: string) => {
         // This callback provides real-time base64 audio data chunks
         if (data && this.transcriptionSocket?.readyState === WebSocket.OPEN) {
           try {
-            // Send audio data directly to AssemblyAI WebSocket
-            this.transcriptionSocket.send(JSON.stringify({
-              audio_data: data
-            }));
-            console.log('Sent audio chunk to AssemblyAI:', data.length, 'characters');
+            // Convert base64 to binary data (React Native compatible)
+            const binaryString = atob(data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            // Add to buffer
+            this.audioBuffer.push(bytes);
+            this.audioBufferSize += bytes.length;
+            
+            // Send when buffer reaches target size (~100ms of audio)
+            if (this.audioBufferSize >= this.targetChunkSize) {
+              this.sendBufferedAudio();
+            }
           } catch (error) {
-            console.error('Error sending audio data:', error);
+            console.error('Error processing audio data:', error);
           }
         }
       });
@@ -327,12 +351,19 @@ export class AIAssistant {
         }
       }
 
+      // Send any remaining buffered audio before terminating
+      if (this.audioBuffer.length > 0) {
+        console.log('📤 Sending remaining buffered audio before termination...');
+        this.sendBufferedAudio();
+        await new Promise(resolve => setTimeout(resolve, 100)); // Brief wait
+      }
+      
       // Properly terminate AssemblyAI session
       if (this.transcriptionSocket && this.transcriptionSocket.readyState === WebSocket.OPEN) {
         try {
           console.log('📤 Sending terminate_session message to AssemblyAI...');
           this.transcriptionSocket.send(JSON.stringify({
-            terminate_session: true
+            type: 'Terminate'
           }));
           
           // Wait a bit for the termination message to be processed
@@ -377,28 +408,30 @@ export class AIAssistant {
   }
 
   private onData(transcript: any): void {
-    if (transcript.message_type === 'PartialTranscript') {
-      this.onTranscriptCallback?.(transcript.text, false);
-    } else if (transcript.message_type === 'FinalTranscript') {
-      console.log(`Final transcript received: "${transcript.text}"`);
-      this.onTranscriptCallback?.(transcript.text, true);
+    if (transcript.type === 'Turn' && !transcript.end_of_turn) {
+      // Partial transcript - update UI
+      this.onTranscriptCallback?.(transcript.transcript, false);
+    } else if (transcript.type === 'Turn' && transcript.end_of_turn && transcript.turn_is_formatted) {
+      // Final formatted transcript - process for AI response
+      console.log(`Final transcript received: "${transcript.transcript}"`);
+      this.onTranscriptCallback?.(transcript.transcript, true);
       
       this.fullTranscript.push({
         role: "user",
-        content: transcript.text
+        content: transcript.transcript
       });
       
       // Generate AI response when we get a final transcript (only if not already processing)
       if (!this.isProcessingAIResponse) {
         console.log('Calling generateAIResponse with final transcript');
-        this.generateAIResponse(transcript.text);
+        this.generateAIResponse(transcript.transcript);
       } else {
         console.log('⚠️ Skipping AI response - already processing another response');
       }
-    } else if (transcript.message_type === 'SessionTerminated') {
+    } else if (transcript.type === 'Termination') {
       console.log('✅ AssemblyAI session properly terminated');
     } else {
-      console.log('📨 AssemblyAI message:', transcript.message_type, transcript);
+      console.log('📨 AssemblyAI message:', transcript.type, transcript);
     }
   }
 
@@ -765,6 +798,41 @@ export class AIAssistant {
     RNFS.unlink(filePath)
       .then(() => console.log('Temporary audio file deleted'))
       .catch((err) => console.error('Error deleting temporary file:', err));
+  }
+
+  // Helper method to send buffered audio data
+  private sendBufferedAudio(): void {
+    if (this.audioBuffer.length === 0) return;
+    
+    try {
+      // Combine all buffered chunks into one large array
+      const totalSize = this.audioBufferSize;
+      const combinedBytes = new Uint8Array(totalSize);
+      let offset = 0;
+      
+      for (const chunk of this.audioBuffer) {
+        combinedBytes.set(chunk, offset);
+        offset += chunk.length;
+      }
+      
+      // Log first chunk for debugging
+      if (!this.loggedFirstAudioChunk) {
+        console.log('🔍 First buffered audio chunk (24 bytes):', Array.from(combinedBytes.slice(0, 24)));
+        console.log('📊 Buffer stats:', this.audioBuffer.length, 'chunks,', totalSize, 'bytes total');
+        this.loggedFirstAudioChunk = true;
+      }
+      
+      // Send the combined audio data
+      this.transcriptionSocket?.send(combinedBytes);
+      console.log('Sent buffered audio chunk to AssemblyAI:', totalSize, 'bytes');
+      
+      // Clear the buffer
+      this.audioBuffer = [];
+      this.audioBufferSize = 0;
+      
+    } catch (error) {
+      console.error('Error sending buffered audio:', error);
+    }
   }
 
   // Comprehensive cleanup method for app shutdown or component unmount
