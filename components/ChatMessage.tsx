@@ -1,4 +1,5 @@
 import { View, Text, StyleSheet } from "react-native";
+import * as React from "react";
 
 export type Message = {
   source: string;
